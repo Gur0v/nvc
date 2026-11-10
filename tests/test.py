@@ -130,6 +130,95 @@ class NvcTests(unittest.TestCase):
     def assert_no_network(self):
         self.assertEqual(self.fixture.requests, [])
 
+    def test_numeric_tags(self):
+        route = "/repos/owner/good/tags?per_page=100&page="
+        text = "[good]\nsource=github-tags\nrepo=owner/good\nsort=numeric\n"
+        cases = [(["16.2", "17.0"], "17.0"), (["9", "10"], "10"),
+                 (["1.9.99", "1.10.0"], "1.10.0"),
+                 (["18446744073709551615", "18446744073709551616"], "18446744073709551616"),
+                 (["9" * 2000, "1" + "0" * 2000], "1" + "0" * 2000),
+                 (["01.00", "1", "1.0.0"], "01.00"),
+                 (["0", "0.0.1", "0.0"], "0.0.1")]
+        for values, expected in cases:
+            with self.subTest(values=values):
+                self.fixture.routes[route + "1"] = (200, json.dumps([{"name": v} for v in values]).encode(), {})
+                result = self.run_nvc(text)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, ("good\t" + expected + "\n").encode())
+        self.fixture.routes[route + "1"] = (200, b'[{"name":"16.2"},{"name":"17.0"}]', {})
+        self.assertEqual(self.run_nvc(text.replace("sort=numeric\n", "")).stdout, b"good\t16.2\n")
+        for bad in ("1.", ".1", "1..2", "v1", "1-rc", "1+2", "-1", "1 2", "١.2"):
+            self.fixture.routes[route + "1"] = (200, json.dumps([{"name": "20"}, {"name": bad}]).encode(), {})
+            result = self.run_nvc(text)
+            self.assert_failure(result, "good", "numeric")
+            self.assertEqual(result.stdout, b"")
+        self.fixture.routes[route + "1"] = (200, b'[{"name":"nightly"},{"name":"v17.0"},{"name":"v18.0"}]', {})
+        result = self.run_nvc(text + "include_regex=^v\nexclude_regex=18\nprefix=v\n")
+        self.assertEqual(result.stdout, b"good\t17.0\n")
+        for source in ("github", "gitlab", "forgejo", "gitea", "regex", "github-commit"):
+            self.assert_failure(self.run_nvc(text.replace("github-tags", source)))
+        for option in ("sort=api", "sort=Numeric", "sort=", "sort=numeric\nsort=numeric"):
+            self.assert_failure(self.run_nvc(text.replace("sort=numeric", option)))
+
+    def test_numeric_other_providers(self):
+        for source, route in (
+            ("gitlab-tags", "/api/v4/projects/owner%2Fgood/repository/tags?order_by=updated&sort=desc&per_page=100&page="),
+            ("forgejo-tags", "/api/v1/repos/owner/good/tags?limit=100&page="),
+            ("gitea-tags", "/api/v1/repos/owner/good/tags?limit=100&page="),
+        ):
+            text = f"[good]\nsource={source}\nhost=https://example.org\nrepo=owner/good\nsort=numeric\n"
+            self.fixture.routes[route + "1"] = (200, json.dumps([{"name": "16.2"}] * 100).encode(), {})
+            self.fixture.routes[route + "2"] = (200, b'[{"name":"17.0"}]', {})
+            result = self.run_nvc(text)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, b"good\t17.0\n")
+            for body in (b"[]", b'[{"name":42}]', b"malformed", b'[{}]'):
+                self.fixture.routes[route + "1"] = (200, body, {})
+                result = self.run_nvc(text)
+                self.assert_failure(result, "good")
+                self.assertEqual(result.stdout, b"")
+
+    def test_numeric_pagination_and_state(self):
+        route = "/repos/owner/good/tags?per_page=100&page="
+        text = "[good]\nsource=github-tags\nrepo=owner/good\nsort=numeric\n"
+        self.fixture.routes[route + "1"] = (200, b'[{"name":"17.0"}]', {"Link": '<https://example.org>; rel="next"'})
+        self.fixture.routes[route + "2"] = (200, b'[{"name":"16.2"}]', {})
+        state = str(Path(self.directory.name) / "state.json")
+        result = self.run_nvc(text, ("check", "-s", state))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"good\t17.0\n")
+        saved = json.loads(Path(state).read_text())
+        self.assertEqual(saved["entries"]["good"]["identity"][9:], [None, "numeric"])
+        result = self.run_nvc(text.replace("sort=numeric\n", ""), ("compare", "-s", state))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"unchecked", result.stdout)
+        self.assert_failure(self.run_nvc(None, ("accept", "-s", state)))
+        self.assertEqual(json.loads(Path(state).read_text()), saved)
+        self.assertEqual(self.run_nvc(text, ("accept", "-s", state)).returncode, 0)
+        original = Path(state).read_bytes()
+        for tail in ([None, "api"], ["branch", "numeric"], [None, None], [None, 1]):
+            malformed = json.loads(original)
+            malformed["entries"]["good"]["identity"][9:] = tail
+            data = json.dumps(malformed).encode()
+            Path(state).write_bytes(data)
+            self.assert_failure(self.run_nvc(text, ("compare", "-s", state)))
+            self.assertEqual(Path(state).read_bytes(), data)
+        Path(state).write_bytes(original)
+        self.fixture.routes[route + "2"] = (200, b'[{"name":"18.0"}]', {})
+        self.assertEqual(self.run_nvc(text).stdout, b"good\t18.0\n")
+        self.fixture.routes[route + "2"] = (500, b"failed", {})
+        result = self.run_nvc(text, ("check", "-s", state))
+        self.assert_failure(result, "good", "http 500")
+        self.assertEqual(result.stdout, b"")
+        self.assert_failure(self.run_nvc(None, ("accept", "-s", state)))
+        for page in range(1, 101):
+            self.fixture.routes[route + str(page)] = (200, b'[{"name":"17.0"}]', {"Link": '<https://example.org>; rel="next"'})
+        result = self.run_nvc(text)
+        self.assert_failure(result, "good", "100 pages")
+        self.assertEqual(result.stdout, b"")
+        self.fixture.routes[route + "100"] = (200, b"[]", {})
+        self.assertEqual(self.run_nvc(text).stdout, b"good\t17.0\n")
+
     def test_valid_config_and_exact_versions(self):
         self.fixture.add("first", release("v01.2+build-β"))
         self.fixture.add("Second", release("release candidate"))
@@ -433,6 +522,90 @@ class NvcTests(unittest.TestCase):
                 self.assertEqual(result.stdout, b"good\tv2\n")
                 if source != "github-tags":
                     self.assertNotIn("Authorization", self.fixture.requests[0][1])
+
+    def test_explicit_tags_pagination_and_errors(self):
+        cases = [
+            ("gitlab-tags", "/api/v4/projects/owner%2Fgood/repository/tags?order_by=updated&sort=desc&per_page=100&page="),
+            ("forgejo-tags", "/api/v1/repos/owner/good/tags?limit=100&page="),
+            ("gitea-tags", "/api/v1/repos/owner/good/tags?limit=100&page="),
+        ]
+        for source, route in cases:
+            text = f"[good]\nsource={source}\nrepo=owner/good\nhost=https://example.org\ninclude_regex=^vv\nprefix=v\n"
+            with self.subTest(source=source):
+                self.fixture.routes[route + "1"] = (200, b'[{"name":"skip"}]', {"Link": '<https://evil.example/>; rel="next"'})
+                self.fixture.routes[route + "2"] = (200, b'[{"name":"vv2"},{"name":"vv99"}]', {})
+                self.fixture.requests.clear()
+                result = self.run_nvc(text)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, b"good\tv2\n")
+                self.assertEqual([r[0] for r in self.fixture.requests], [route + "1", route + "2"])
+                for body in (b'{}', b'[]', b'[{}]', b'[{"name":null}]', b'[{"name":""}]', b'[{"name":"x\\n"}]', json.dumps([{"name": "skip"}] * 101).encode()):
+                    self.fixture.routes[route + "1"] = (200, body, {})
+                    self.assert_failure(self.run_nvc(text), "good")
+
+    def test_branch_commits_and_authentication(self):
+        cases = [
+            ("github", "", "/repos/owner/good/branches/feature%2Fx%3Fq%23z", "sha", "Authorization", "Bearer explicit"),
+            ("gitlab", "host=https://example.org\n", "/api/v4/projects/owner%2Fgood/repository/branches/feature%2Fx%3Fq%23z", "id", "PRIVATE-TOKEN", "explicit"),
+            ("forgejo", "host=https://example.org\n", "/api/v1/repos/owner/good/branches/feature%2Fx%3Fq%23z", "id", "Authorization", "Bearer explicit"),
+            ("gitea", "host=https://example.org\n", "/api/v1/repos/owner/good/branches/feature%2Fx%3Fq%23z", "id", "Authorization", "Bearer explicit"),
+        ]
+        for provider, host, route, field, header, value in cases:
+            text = f"[good]\nsource={provider}-commit\nrepo=owner/good\n{host}branch=feature/x?q#z\ntoken_env=NVC_FIXTURE_TOKEN\n"
+            with self.subTest(provider=provider):
+                for length in (40, 64):
+                    commit = "aB12" * (length // 4)
+                    self.fixture.routes[route] = (200, json.dumps({"commit": {field: commit}}).encode(), {"Link": '<https://evil.example/>; rel="next"'})
+                    self.fixture.requests.clear()
+                    result = self.run_nvc(text, env={"NVC_FIXTURE_TOKEN": "explicit", "GITHUB_TOKEN": "github-only"})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, f"good\t{commit}\n".encode())
+                    self.assertEqual(len(self.fixture.requests), 1)
+                    self.assertEqual(self.fixture.requests[0][1][header], value)
+                    self.assertNotIn(b"explicit", result.stdout + result.stderr)
+                    self.assert_failure(self.run_nvc(text + "exclude_regex=^a\n"), "good", "no matching")
+                for body in (b'[]', b'{}', b'{"commit":null}', b'{"commit":[]}', b'{"commit":{}}', json.dumps({"commit": {field: 12}}).encode(), *[json.dumps({"commit": {field: v}}).encode() for v in ("", "a" * 39, "a" * 41, "a" * 63, "a" * 65, "g" * 40, "a" * 39 + "\n", "a" * 39 + "\0")]):
+                    self.fixture.routes[route] = (200, body, {})
+                    self.assert_failure(self.run_nvc(text), "good")
+                self.fixture.routes[route] = (404, b'{}', {})
+                self.fixture.requests.clear()
+                self.assert_failure(self.run_nvc(text), "good", "404")
+                self.assertEqual(len(self.fixture.requests), 1)
+                for bad in (text.replace("branch=feature/x?q#z\n", ""), text + "branch=other\n", text + "prefix=a\n", text.replace("branch=feature/x?q#z", "branch="), text.replace("-commit", "-tags"), text.replace("feature/x?q#z", "."), text.replace("feature/x?q#z", "..")):
+                    self.fixture.requests.clear()
+                    self.assert_failure(self.run_nvc(bad))
+                    self.assert_no_network()
+
+    def test_branch_identity_and_legacy_state(self):
+        self.fixture.add("legacy")
+        route = "/repos/owner/good/branches/"
+        for branch in ("main", "next"):
+            self.fixture.routes[route + branch] = (200, json.dumps({"commit": {"sha": "a" * 40}}).encode(), {})
+        text = config("legacy") + "[good]\nsource=github-commit\nrepo=owner/good\nbranch=main\n"
+        result = self.run_nvc(text, self.state_args("check"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = Path(self.directory.name) / "state.json"
+        saved = json.loads(state.read_text())
+        self.assertEqual(len(saved["entries"]["legacy"]["identity"]), 9)
+        self.assertEqual(saved["entries"]["good"]["identity"][9], "main")
+        self.assertEqual(self.run_nvc(args=self.state_args("accept")).returncode, 0)
+        before = state.read_bytes()
+        changed = text.replace("branch=main", "branch=next")
+        self.fixture.requests.clear()
+        self.assert_failure(self.run_nvc(changed, self.state_args("accept")))
+        self.assertEqual(state.read_bytes(), before)
+        result = self.run_nvc(args=self.state_args("compare", "good"))
+        self.assertEqual(result.stdout, b"good\tunchecked\t\t\n")
+        self.assert_no_network()
+        self.assertEqual(self.run_nvc(args=self.state_args("check", "good")).returncode, 0)
+        self.assertEqual(json.loads(state.read_text())["entries"]["legacy"], json.loads(before)["entries"]["legacy"])
+        for tail in ([None], ["main", "extra"], [12]):
+            invalid = json.loads(before)
+            invalid["entries"]["good"]["identity"] = invalid["entries"]["good"]["identity"][:9] + tail
+            state.write_text(json.dumps(invalid))
+            previous = state.read_bytes()
+            self.assert_failure(self.run_nvc(args=self.state_args("accept")))
+            self.assertEqual(state.read_bytes(), previous)
 
     def test_pagination_and_regex(self):
         self.fixture.routes["/repos/owner/good/tags?per_page=100&page=1"] = (200, json.dumps([{"name": "skip"}] * 100).encode(), {})

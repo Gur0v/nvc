@@ -83,10 +83,10 @@ static struct json_object *identity(struct project *p)
 {
 	struct json_object *id = json_object_new_array();
 	const char *values[] = {p->source,  p->repo,	p->host,   p->url,	p->regex,
-				p->include, p->exclude, p->prefix, p->token_env};
+				p->include, p->exclude, p->prefix, p->token_env, p->branch, p->sort};
 	if (!id)
 		return NULL;
-	for (size_t i = 0; i < sizeof(values) / sizeof(*values); i++) {
+	for (size_t i = 0; i < (p->sort ? 11U : p->branch ? 10U : 9U); i++) {
 		struct json_object *v = values[i] ? json_object_new_string(values[i]) : NULL;
 		if ((values[i] && !v) || json_object_array_add(id, v)) {
 			json_object_put(v);
@@ -171,7 +171,8 @@ static struct json_object *state_read(const char *path)
 		    json_object_object_length(entry) != 4 ||
 		    !json_object_object_get_ex(entry, "identity", &id) ||
 		    !json_object_is_type(id, json_type_array) ||
-		    json_object_array_length(id) != 9 ||
+		    (json_object_array_length(id) != 9 && json_object_array_length(id) != 10 &&
+		     json_object_array_length(id) != 11) ||
 		    !json_object_object_get_ex(entry, "accepted", &accepted) ||
 		    !state_string(accepted) ||
 		    !json_object_object_get_ex(entry, "pending", &pending) ||
@@ -180,9 +181,21 @@ static struct json_object *state_read(const char *path)
 		    !json_object_is_type(eligible, json_type_boolean) ||
 		    (json_object_get_boolean(eligible) && !pending))
 			goto bad;
-		if (!json_object_is_type(json_object_array_get_idx(id, 0), json_type_string))
+		if ((json_object_array_length(id) == 10 &&
+		     !json_object_is_type(json_object_array_get_idx(id, 9), json_type_string)) ||
+		    !json_object_is_type(json_object_array_get_idx(id, 0), json_type_string))
 			goto bad;
-		for (size_t i = 0; i < 9; i++)
+		if (json_object_array_length(id) == 11) {
+			const char *source = json_object_get_string(json_object_array_get_idx(id, 0));
+			struct json_object *sort = json_object_array_get_idx(id, 10);
+			if (json_object_array_get_idx(id, 9) ||
+			    (strcmp(source, "github-tags") && strcmp(source, "gitlab-tags") &&
+			     strcmp(source, "forgejo-tags") && strcmp(source, "gitea-tags")) ||
+			    !json_object_is_type(sort, json_type_string) ||
+			    strcmp(json_object_get_string(sort), "numeric"))
+				goto bad;
+		}
+		for (size_t i = 0; i < json_object_array_length(id); i++)
 			if (!state_string(json_object_array_get_idx(id, i)))
 				goto bad;
 	}

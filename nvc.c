@@ -24,6 +24,8 @@ struct project {
 	char *name;
 	char *source;
 	char *repo;
+	char *branch, *sort;
+	bool github, gitlab, tags, commit;
 	char *host, *url, *regex, *include, *exclude, *prefix, *token_env;
 	regex_t extract_re, include_re, exclude_re;
 	bool extract_ready, include_ready, exclude_ready;
@@ -129,11 +131,13 @@ static void config_free(struct config *cfg)
 		free(p->name);
 		free(p->source);
 		free(p->repo);
+		free(p->branch);
 		free(p->host);
 		free(p->url);
 		free(p->regex);
 		free(p->include);
 		free(p->exclude);
+		free(p->sort);
 		free(p->prefix);
 		free(p->token_env);
 		if (p->extract_ready)
@@ -250,6 +254,10 @@ static int config_read(struct config *cfg, const char *path)
 			dest = &p->source;
 		else if (!strcmp(s, "repo"))
 			dest = &p->repo;
+		else if (!strcmp(s, "sort"))
+			dest = &p->sort;
+		else if (!strcmp(s, "branch"))
+			dest = &p->branch;
 		else if (!strcmp(s, "host"))
 			dest = &p->host;
 		else if (!strcmp(s, "url"))
@@ -310,17 +318,29 @@ static int config_read(struct config *cfg, const char *path)
 	}
 	for (size_t i = 0; i < cfg->len; i++) {
 		p = &cfg->items[i];
-		bool github = p->source &&
-			      (!strcmp(p->source, "github") || !strcmp(p->source, "github-tags"));
-		bool gitlab = p->source && !strcmp(p->source, "gitlab");
-		bool forge =
-		    p->source && (!strcmp(p->source, "forgejo") || !strcmp(p->source, "gitea"));
-		bool regex = p->source && !strcmp(p->source, "regex");
-		if ((!github && !gitlab && !forge && !regex) ||
+		const char *sources[] = {"github", "github-tags", "github-commit", "gitlab",
+			"gitlab-tags", "gitlab-commit", "forgejo", "forgejo-tags", "forgejo-commit",
+			"gitea", "gitea-tags", "gitea-commit", "regex"};
+		bool known = false;
+		for (size_t k = 0; p->source && k < sizeof(sources) / sizeof(*sources); k++)
+			known |= !strcmp(p->source, sources[k]);
+		if (!known)
+			goto invalid;
+		p->github = !strncmp(p->source, "github", 6);
+		p->gitlab = !strncmp(p->source, "gitlab", 6);
+		p->tags = strstr(p->source, "-tags") != NULL;
+		p->commit = strstr(p->source, "-commit") != NULL;
+		bool github = p->github, gitlab = p->gitlab;
+		bool regex = !strcmp(p->source, "regex");
+		if ((p->sort && (!p->tags || strcmp(p->sort, "numeric"))) ||
+		    (p->commit != (p->branch != NULL)) ||
+		    (p->commit && (p->prefix || !strcmp(p->branch, ".") ||
+				   !strcmp(p->branch, "..") || !utf8_valid((const unsigned char *)p->branch,
+							 strlen(p->branch)))) ||
 		    (regex ? (!p->url || !p->regex || p->repo || p->host || p->token_env)
 			   : (!p->repo || p->url || p->regex ||
 			      (github ? p->host != NULL : !p->host))) ||
-		    ((github || forge) && !repo_valid(p->repo)))
+		    (!regex && !gitlab && !repo_valid(p->repo)))
 			goto invalid;
 		if (gitlab) {
 			if (!p->repo || !strchr(p->repo, '/') || p->repo[0] == '/' ||
@@ -454,7 +474,8 @@ static int request_start(CURLM *multi, struct project *p, const char *base, long
 {
 	char *url, *escaped;
 	size_t len = strlen(base) + (p->host ? strlen(p->host) : 0) +
-		     (p->repo ? strlen(p->repo) * 3 : 0) + (p->url ? strlen(p->url) : 0) + 160;
+		     (p->repo ? strlen(p->repo) * 3 : 0) +
+		     (p->branch ? strlen(p->branch) * 3 : 0) + (p->url ? strlen(p->url) : 0) + 160;
 	CURLcode code = CURLE_OK;
 	CURLMcode mc;
 	p->len = 0;
@@ -482,27 +503,44 @@ static int request_start(CURLM *multi, struct project *p, const char *base, long
 			snprintf(url, len, "%s%s", base, path ? path : "/");
 		}
 #endif
-	} else if (!strcmp(p->source, "gitlab")) {
+	} else if (p->gitlab) {
 		escaped = curl_easy_escape(p->easy, p->repo, 0);
+		char *branch = p->branch ? curl_easy_escape(p->easy, p->branch, 0) : NULL;
+		if (!escaped || (p->branch && !branch)) {
+			curl_free(escaped);
+			curl_free(branch);
+			free(url);
+			goto fail;
+		}
+		if (p->commit)
+			snprintf(url, len, "%s/api/v4/projects/%s/repository/branches/%s",
+				 origin, escaped, branch);
+		else
+			snprintf(url, len,
+				 "%s/api/v4/projects/%s/%s?order_by=%s&sort=desc&per_page=100&page=%u",
+				 origin, escaped, p->tags ? "repository/tags" : "releases",
+				 p->tags ? "updated" : "released_at", p->page);
+		curl_free(escaped);
+		curl_free(branch);
+	} else if (p->commit) {
+		escaped = curl_easy_escape(p->easy, p->branch, 0);
 		if (!escaped) {
 			free(url);
 			goto fail;
 		}
-		snprintf(url, len,
-			 "%s/api/v4/projects/%s/"
-			 "releases?order_by=released_at&sort=desc&per_page=100&page=%u",
-			 origin, escaped, p->page);
+		snprintf(url, len, "%s%s/repos/%s/branches/%s", origin,
+			 p->github ? "" : "/api/v1", p->repo, escaped);
 		curl_free(escaped);
-	} else if (!strcmp(p->source, "github"))
+	} else if (p->tags)
+		snprintf(url, len, "%s%s/repos/%s/tags?%s=100&page=%u", origin,
+			 p->github ? "" : "/api/v1", p->repo,
+			 p->github ? "per_page" : "limit", p->page);
+	else if (p->github)
 		snprintf(url, len, "%s/repos/%s/releases/latest", origin, p->repo);
-	else if (!strcmp(p->source, "github-tags"))
-		snprintf(url, len, "%s/repos/%s/tags?per_page=100&page=%u", origin, p->repo,
-			 p->page);
 	else
-		snprintf(
-		    url, len,
-		    "%s/api/v1/repos/%s/releases?draft=false&pre-release=false&limit=100&page=%u",
-		    origin, p->repo, p->page);
+		snprintf(url, len,
+			 "%s/api/v1/repos/%s/releases?draft=false&pre-release=false&limit=100&page=%u",
+			 origin, p->repo, p->page);
 #define SETOPT(option, value)                                                                      \
 	do {                                                                                       \
 		code = curl_easy_setopt(p->easy, option, value);                                   \
@@ -578,7 +616,7 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 		struct project *p = &cfg->items[i];
 		if (!p->selected)
 			continue;
-		bool github = !strcmp(p->source, "github") || !strcmp(p->source, "github-tags");
+		bool github = p->github;
 		const char *secret = p->token_env ? getenv(p->token_env) : (github ? token : NULL);
 		p->headers = curl_slist_append(NULL, "Accept: application/json");
 		if (!p->headers)
@@ -595,8 +633,7 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 		if (!auth)
 			goto done;
 		snprintf(auth, len, "%s%s",
-			 !strcmp(p->source, "gitlab") ? "PRIVATE-TOKEN: "
-						      : "Authorization: Bearer ",
+			 p->gitlab ? "PRIVATE-TOKEN: " : "Authorization: Bearer ",
 			 secret);
 		next = curl_slist_append(p->headers, auth);
 		free(auth);
@@ -629,7 +666,7 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 						 curl_easy_strerror(msg->data.result));
 			} else if (http != 200) {
 				snprintf(p->error, sizeof(p->error), "HTTP %ld%s", http,
-					 http == 404   ? ": no release or repository not accessible"
+					 http == 404   ? ": source item missing or repository not accessible"
 					 : http == 403 ? ": rate limit or permission denied"
 					 : http == 429 ? ": rate limit exceeded"
 						       : "");

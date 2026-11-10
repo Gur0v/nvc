@@ -19,6 +19,44 @@ done:
 	return root;
 }
 
+static bool numeric_valid(const char *s)
+{
+	for (;;) {
+		if (*s < '0' || *s > '9')
+			return false;
+		while (*s >= '0' && *s <= '9')
+			s++;
+		if (!*s)
+			return true;
+		if (*s++ != '.')
+			return false;
+	}
+}
+
+static int numeric_compare(const char *a, const char *b)
+{
+	while (*a || *b) {
+		while (*a == '0')
+			a++;
+		while (*b == '0')
+			b++;
+		size_t na = strspn(a, "0123456789");
+		size_t nb = strspn(b, "0123456789");
+		if (na != nb)
+			return na > nb ? 1 : -1;
+		int cmp = strncmp(a, b, na);
+		if (cmp)
+			return cmp;
+		a += na;
+		b += nb;
+		if (*a == '.')
+			a++;
+		if (*b == '.')
+			b++;
+	}
+	return 0;
+}
+
 static int candidate(struct project *p, const char *value, size_t len)
 {
 	if (!len || controls(value, len) || !utf8_valid((const unsigned char *)value, len))
@@ -30,8 +68,18 @@ static int candidate(struct project *p, const char *value, size_t len)
 		value += strlen(p->prefix);
 	if (!*value)
 		return -1;
-	p->version = strdup(value);
-	return p->version ? 1 : -1;
+	if (p->sort) {
+		if (!numeric_valid(value))
+			return -2;
+		if (p->version && numeric_compare(value, p->version) <= 0)
+			return 1;
+	}
+	char *version = strdup(value);
+	if (!version)
+		return -1;
+	free(p->version);
+	p->version = version;
+	return 1;
 }
 
 static void source_parse(struct project *p)
@@ -39,8 +87,8 @@ static void source_parse(struct project *p)
 	struct json_object *root = NULL, *item, *tag, *flag;
 	const char *error = "invalid source response";
 	bool github = !strcmp(p->source, "github");
-	bool tags = !strcmp(p->source, "github-tags");
-	bool gitlab = !strcmp(p->source, "gitlab");
+	bool tags = p->tags;
+	bool gitlab = p->gitlab;
 	p->more = false;
 	if (p->extract_ready) {
 		regmatch_t match[2];
@@ -58,6 +106,23 @@ static void source_parse(struct project *p)
 		goto done;
 	}
 	root = parse_json(p->body, p->len);
+	if (p->commit) {
+		struct json_object *commit;
+		if (!root || !json_object_is_type(root, json_type_object) ||
+		    !json_object_object_get_ex(root, "commit", &commit) ||
+		    !json_object_is_type(commit, json_type_object) ||
+		    !json_object_object_get_ex(commit, p->github ? "sha" : "id", &tag) ||
+		    !json_object_is_type(tag, json_type_string))
+			goto done;
+		const char *id = json_object_get_string(tag);
+		size_t len = (size_t)json_object_get_string_len(tag);
+		if ((len != 40 && len != 64) || strspn(id, "0123456789abcdefABCDEF") != len)
+			goto done;
+		int result = candidate(p, id, len);
+		error = result == 1 ? NULL
+			: result == 0 ? "no matching candidate" : "invalid commit identifier";
+		goto done;
+	}
 	if (!root || !json_object_is_type(root, github ? json_type_object : json_type_array))
 		goto done;
 	size_t count = github ? 1 : json_object_array_length(root);
@@ -94,10 +159,10 @@ static void source_parse(struct project *p)
 		int result = candidate(p, json_object_get_string(tag),
 				       (size_t)json_object_get_string_len(tag));
 		if (result < 0) {
-			error = "invalid version identifier";
+			error = result == -2 ? "invalid numeric tag identifier" : "invalid version identifier";
 			goto done;
 		}
-		if (result > 0) {
+		if (result > 0 && !p->sort) {
 			error = NULL;
 			goto done;
 		}
@@ -109,8 +174,10 @@ static void source_parse(struct project *p)
 			p->more = true;
 			error = NULL;
 		}
-	} else
-		error = "no matching stable candidate";
+	} else if (p->sort && p->version)
+		error = NULL;
+	else
+		error = tags ? "no matching tag" : "no matching stable candidate";
 done:
 	if (error)
 		snprintf(p->error, sizeof(p->error), "%s", error);
