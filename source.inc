@@ -86,9 +86,9 @@ static void source_parse(struct project *p)
 {
 	struct json_object *root = NULL, *item, *tag, *flag;
 	const char *error = "invalid source response";
-	bool github = !strcmp(p->source, "github");
-	bool tags = p->tags;
-	bool gitlab = p->gitlab;
+	bool github = p->type->provider == GITHUB && p->type->operation == RELEASE;
+	bool tags = p->type->operation == TAGS;
+	bool gitlab = p->type->provider == GITLAB;
 	p->more = false;
 	if (p->extract_ready) {
 		regmatch_t match[2];
@@ -106,12 +106,12 @@ static void source_parse(struct project *p)
 		goto done;
 	}
 	root = parse_json(p->body, p->len);
-	if (p->commit) {
+	if (p->type->operation == COMMIT) {
 		struct json_object *commit;
 		if (!root || !json_object_is_type(root, json_type_object) ||
 		    !json_object_object_get_ex(root, "commit", &commit) ||
 		    !json_object_is_type(commit, json_type_object) ||
-		    !json_object_object_get_ex(commit, p->github ? "sha" : "id", &tag) ||
+		    !json_object_object_get_ex(commit, p->type->provider == GITHUB ? "sha" : "id", &tag) ||
 		    !json_object_is_type(tag, json_type_string))
 			goto done;
 		const char *id = json_object_get_string(tag);

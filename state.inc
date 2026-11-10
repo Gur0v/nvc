@@ -186,11 +186,11 @@ static struct json_object *state_read(const char *path)
 		    !json_object_is_type(json_object_array_get_idx(id, 0), json_type_string))
 			goto bad;
 		if (json_object_array_length(id) == 11) {
-			const char *source = json_object_get_string(json_object_array_get_idx(id, 0));
+			const struct source_type *type =
+				source_lookup(json_object_get_string(json_object_array_get_idx(id, 0)));
 			struct json_object *sort = json_object_array_get_idx(id, 10);
 			if (json_object_array_get_idx(id, 9) ||
-			    (strcmp(source, "github-tags") && strcmp(source, "gitlab-tags") &&
-			     strcmp(source, "forgejo-tags") && strcmp(source, "gitea-tags")) ||
+			    !type || type->operation != TAGS ||
 			    !json_object_is_type(sort, json_type_string) ||
 			    strcmp(json_object_get_string(sort), "numeric"))
 				goto bad;
@@ -291,6 +291,10 @@ static int state_run(struct config *cfg, const char *path, const char *command)
 	json_object_object_get_ex(root, "entries", &entries);
 	status = 0;
 	bool check = !strcmp(command, "check"), accept = !strcmp(command, "accept");
+	if (!check && !accept) {
+		close(fd);
+		fd = -1;
+	}
 	for (size_t i = 0; i < cfg->len; i++) {
 		struct project *p = &cfg->items[i];
 		struct json_object *entry = NULL, *oldid = NULL, *accepted = NULL, *pending = NULL,

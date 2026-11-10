@@ -25,7 +25,7 @@ struct project {
 	char *source;
 	char *repo;
 	char *branch, *sort;
-	bool github, gitlab, tags, commit;
+	const struct source_type *type;
 	char *host, *url, *regex, *include, *exclude, *prefix, *token_env;
 	regex_t extract_re, include_re, exclude_re;
 	bool extract_ready, include_ready, exclude_ready;
@@ -48,6 +48,37 @@ struct config {
 	size_t len;
 	size_t capacity;
 };
+
+enum provider { GITHUB, GITLAB, FORGE, WEB };
+enum operation { RELEASE, TAGS, COMMIT, EXTRACT };
+
+static const struct source_type {
+	const char *name;
+	enum provider provider;
+	enum operation operation;
+} sources[] = {
+	{"github", GITHUB, RELEASE},
+	{"github-tags", GITHUB, TAGS},
+	{"github-commit", GITHUB, COMMIT},
+	{"gitlab", GITLAB, RELEASE},
+	{"gitlab-tags", GITLAB, TAGS},
+	{"gitlab-commit", GITLAB, COMMIT},
+	{"forgejo", FORGE, RELEASE},
+	{"forgejo-tags", FORGE, TAGS},
+	{"forgejo-commit", FORGE, COMMIT},
+	{"gitea", FORGE, RELEASE},
+	{"gitea-tags", FORGE, TAGS},
+	{"gitea-commit", FORGE, COMMIT},
+	{"regex", WEB, EXTRACT},
+};
+
+static const struct source_type *source_lookup(const char *name)
+{
+	for (size_t i = 0; name && i < sizeof(sources) / sizeof(*sources); i++)
+		if (!strcmp(name, sources[i].name))
+			return &sources[i];
+	return NULL;
+}
 
 static int project_compare(const void *a, const void *b)
 {
@@ -318,23 +349,15 @@ static int config_read(struct config *cfg, const char *path)
 	}
 	for (size_t i = 0; i < cfg->len; i++) {
 		p = &cfg->items[i];
-		const char *sources[] = {"github", "github-tags", "github-commit", "gitlab",
-			"gitlab-tags", "gitlab-commit", "forgejo", "forgejo-tags", "forgejo-commit",
-			"gitea", "gitea-tags", "gitea-commit", "regex"};
-		bool known = false;
-		for (size_t k = 0; p->source && k < sizeof(sources) / sizeof(*sources); k++)
-			known |= !strcmp(p->source, sources[k]);
-		if (!known)
+		p->type = source_lookup(p->source);
+		if (!p->type)
 			goto invalid;
-		p->github = !strncmp(p->source, "github", 6);
-		p->gitlab = !strncmp(p->source, "gitlab", 6);
-		p->tags = strstr(p->source, "-tags") != NULL;
-		p->commit = strstr(p->source, "-commit") != NULL;
-		bool github = p->github, gitlab = p->gitlab;
-		bool regex = !strcmp(p->source, "regex");
-		if ((p->sort && (!p->tags || strcmp(p->sort, "numeric"))) ||
-		    (p->commit != (p->branch != NULL)) ||
-		    (p->commit && (p->prefix || !strcmp(p->branch, ".") ||
+		bool github = p->type->provider == GITHUB;
+		bool gitlab = p->type->provider == GITLAB;
+		bool regex = p->type->operation == EXTRACT;
+		if ((p->sort && (p->type->operation != TAGS || strcmp(p->sort, "numeric"))) ||
+		    ((p->type->operation == COMMIT) != (p->branch != NULL)) ||
+		    ((p->type->operation == COMMIT) && (p->prefix || !strcmp(p->branch, ".") ||
 				   !strcmp(p->branch, "..") || !utf8_valid((const unsigned char *)p->branch,
 							 strlen(p->branch)))) ||
 		    (regex ? (!p->url || !p->regex || p->repo || p->host || p->token_env)
@@ -368,7 +391,7 @@ static int config_read(struct config *cfg, const char *path)
 					valid = false;
 				curl_free(part);
 				part = NULL;
-				if (p->host && (strchr(value + 8, '/') || strchr(value + 8, '?')))
+				if (valid && p->host && (strchr(value + 8, '/') || strchr(value + 8, '?')))
 					valid = false;
 			}
 			curl_free(scheme);
@@ -479,7 +502,8 @@ static int request_start(CURLM *multi, struct project *p, const char *base, long
 	CURLcode code = CURLE_OK;
 	CURLMcode mc;
 	p->len = 0;
-	p->capacity = 0;
+	if (p->body)
+		p->body[0] = 0;
 	p->more = false;
 	p->page++;
 	p->next_page = false;
@@ -503,7 +527,7 @@ static int request_start(CURLM *multi, struct project *p, const char *base, long
 			snprintf(url, len, "%s%s", base, path ? path : "/");
 		}
 #endif
-	} else if (p->gitlab) {
+	} else if ((p->type->provider == GITLAB)) {
 		escaped = curl_easy_escape(p->easy, p->repo, 0);
 		char *branch = p->branch ? curl_easy_escape(p->easy, p->branch, 0) : NULL;
 		if (!escaped || (p->branch && !branch)) {
@@ -512,30 +536,30 @@ static int request_start(CURLM *multi, struct project *p, const char *base, long
 			free(url);
 			goto fail;
 		}
-		if (p->commit)
+		if ((p->type->operation == COMMIT))
 			snprintf(url, len, "%s/api/v4/projects/%s/repository/branches/%s",
 				 origin, escaped, branch);
 		else
 			snprintf(url, len,
 				 "%s/api/v4/projects/%s/%s?order_by=%s&sort=desc&per_page=100&page=%u",
-				 origin, escaped, p->tags ? "repository/tags" : "releases",
-				 p->tags ? "updated" : "released_at", p->page);
+				 origin, escaped, (p->type->operation == TAGS) ? "repository/tags" : "releases",
+				 (p->type->operation == TAGS) ? "updated" : "released_at", p->page);
 		curl_free(escaped);
 		curl_free(branch);
-	} else if (p->commit) {
+	} else if ((p->type->operation == COMMIT)) {
 		escaped = curl_easy_escape(p->easy, p->branch, 0);
 		if (!escaped) {
 			free(url);
 			goto fail;
 		}
 		snprintf(url, len, "%s%s/repos/%s/branches/%s", origin,
-			 p->github ? "" : "/api/v1", p->repo, escaped);
+			 (p->type->provider == GITHUB) ? "" : "/api/v1", p->repo, escaped);
 		curl_free(escaped);
-	} else if (p->tags)
+	} else if ((p->type->operation == TAGS))
 		snprintf(url, len, "%s%s/repos/%s/tags?%s=100&page=%u", origin,
-			 p->github ? "" : "/api/v1", p->repo,
-			 p->github ? "per_page" : "limit", p->page);
-	else if (p->github)
+			 (p->type->provider == GITHUB) ? "" : "/api/v1", p->repo,
+			 (p->type->provider == GITHUB) ? "per_page" : "limit", p->page);
+	else if ((p->type->provider == GITHUB))
 		snprintf(url, len, "%s/repos/%s/releases/latest", origin, p->repo);
 	else
 		snprintf(url, len,
@@ -579,6 +603,8 @@ setup_fail:
 	free(url);
 	snprintf(p->error, sizeof(p->error), "%s", curl_easy_strerror(code));
 fail:
+	if (!p->error[0])
+		snprintf(p->error, sizeof(p->error), "cannot encode request path");
 	if (p->easy)
 		curl_easy_cleanup(p->easy);
 	p->easy = NULL;
@@ -588,8 +614,6 @@ fail:
 static int fetch(struct config *cfg, unsigned jobs, const char *token)
 {
 	CURLM *multi = NULL;
-	struct curl_slist *next;
-	char *auth = NULL;
 	const char *base = "https://api.github.com";
 	long timeout = 30000;
 	size_t cursor = 0;
@@ -616,7 +640,7 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 		struct project *p = &cfg->items[i];
 		if (!p->selected)
 			continue;
-		bool github = p->github;
+		bool github = (p->type->provider == GITHUB);
 		const char *secret = p->token_env ? getenv(p->token_env) : (github ? token : NULL);
 		p->headers = curl_slist_append(NULL, "Accept: application/json");
 		if (!p->headers)
@@ -629,15 +653,14 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 				goto done;
 			}
 		size_t len = strlen(secret) + 32;
-		auth = malloc(len);
+		char *auth = malloc(len);
 		if (!auth)
 			goto done;
 		snprintf(auth, len, "%s%s",
-			 p->gitlab ? "PRIVATE-TOKEN: " : "Authorization: Bearer ",
+			 (p->type->provider == GITLAB) ? "PRIVATE-TOKEN: " : "Authorization: Bearer ",
 			 secret);
-		next = curl_slist_append(p->headers, auth);
+		struct curl_slist *next = curl_slist_append(p->headers, auth);
 		free(auth);
-		auth = NULL;
 		if (!next)
 			goto done;
 		p->headers = next;
@@ -676,11 +699,12 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 			curl_multi_remove_handle(multi, p->easy);
 			curl_easy_cleanup(p->easy);
 			p->easy = NULL;
+			if (p->more && !request_start(multi, p, base, timeout))
+				continue;
+			active--;
 			free(p->body);
 			p->body = NULL;
-			active--;
-			if (p->more && !request_start(multi, p, base, timeout))
-				active++;
+			p->capacity = 0;
 		}
 		if (active && (active == jobs || cursor == cfg->len)) {
 			mc = curl_multi_poll(multi, NULL, 0, 1000, NULL);
@@ -704,7 +728,6 @@ done:
 	}
 	if (multi)
 		curl_multi_cleanup(multi);
-	free(auth);
 	curl_global_cleanup();
 	return status;
 }
@@ -772,7 +795,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
-	if (!path || (!!command != !!state)) {
+	if (!path || (!!command != !!state) || (state && !*state)) {
 		usage(stderr);
 		return 1;
 	}
