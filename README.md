@@ -18,8 +18,7 @@ make
 make test
 ```
 
-The executable is `./nvc`; there is no install target. Standard compiler and
-linker overrides are supported. Run `make clean` before changing build flags.
+Run `./nvc` after building. Run `make clean` before changing build flags.
 
 ## Usage
 
@@ -90,8 +89,6 @@ Sources and required settings:
 - `github-commit`, `gitlab-commit`, `forgejo-commit`, or `gitea-commit`: `repo`
   and explicit `branch`, plus `host` for non-GitHub sources. Returns the branch
   head's full commit ID, never a shortened ID. No default branch or tag lookup.
-  For example, `source=github-commit`, `repo=neovim/neovim`, and `branch=master`.
-  Branch names are URL-encoded as a single path parameter.
 - `regex`: `url` and `pattern`; first capture group of the first POSIX ERE match.
   For example, `pattern=version=([0-9]+[.][0-9]+)` extracts from text such as
   `version=1.2`. Matching does not use `REG_NEWLINE`.
@@ -108,17 +105,12 @@ Commit sources apply filters to the full ID and reject `prefix` to preserve it.
 `branch` is rejected on other sources. Empty identifiers, control characters,
 invalid UTF-8, and NUL regex bodies fail.
 
-Tag sources alone accept `sort = numeric` to select the greatest eligible tag
-across all pages instead of the first in API order. After raw filters and literal
-prefix removal, every eligible identifier must match `[0-9]+([.][0-9]+)*` using
-ASCII digits; a nonnumeric identifier fails the check. Components are nonnegative
-integers of any length within response limits, compared left to right without
-integer conversion. Leading zeros do not matter; missing trailing components
-are zero, so `01.2`, `1.2.0`, and `1.2` tie. The first encountered spelling wins
-a tie and is preserved after prefix removal. This is not semantic versioning.
-Releases, commits, and regex sources reject `sort`; no other value is supported.
-For example, `sort = numeric` with `prefix = v` selects `17.0` over `16.2` even
-when `v16.2` appears first. Changing this option invalidates saved observations.
+Tag sources accept `sort = numeric` to select the greatest eligible tag across
+all pages. After filtering and prefix removal, each candidate must contain only
+dot-separated ASCII integers, or the check fails. Components compare left to
+right: `1.10` beats `1.9`. Leading zeros and missing trailing zero components
+compare equal, so `01.2`, `1.2.0`, and `1.2` tie. The first encountered spelling
+wins ties. Changing `sort` invalidates saved observations.
 
 INI names and keys are case-sensitive. Duplicate sections or keys, unknown keys,
 missing values, and unsupported sources fail before requests begin. Full-line
@@ -130,7 +122,9 @@ trimmed; values have no quoting, escapes, inline comments, or expansion.
 `GITHUB_TOKEN` applies only to GitHub. API sources can select another environment
 variable with `token_env`; regex sources cannot use tokens. GitLab uses
 `PRIVATE-TOKEN`, other APIs Bearer authorization. Empty or unset tokens mean
-anonymous access. Token values are never saved or printed.
+anonymous access. Token values are never saved or printed. Use only trusted
+configuration with credentials: `token_env` can select any environment variable,
+and non-GitHub API entries choose where it is sent.
 
 TLS verification is enabled and redirects are rejected. Requests have a 10-second
 connection timeout, a 30-second total timeout, and a 1 MiB response limit.
@@ -146,6 +140,11 @@ only when no nvc process is running.
 
 Tests use local fixtures without upstream access or real credentials.
 See [DESIGN.md](DESIGN.md) for persistence details and API references.
+
+## Real-world example
+
+[Gur0v/ports](https://github.com/Gur0v/ports) shows how to keep a `.nvc.ini`
+next to each `Pkgfile` and report upstream versions that differ from the recipes.
 
 ## License
 
