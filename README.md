@@ -3,9 +3,9 @@
 A minimal nv checker in C.
 
 nvc checks upstream versions from INI files using concurrent HTTP requests.
-It supports GitHub releases and tags, GitLab releases, Forgejo/Gitea releases,
-and regex extraction from public HTTPS pages. Versions are opaque strings;
-nvc does not sort them numerically.
+It supports GitHub, GitLab, and Forgejo/Gitea releases, tags, and branch-head
+commits, plus regex extraction from public HTTPS pages. Versions are opaque
+strings by default; tag sources can opt into numeric selection.
 
 ## Building
 
@@ -85,6 +85,13 @@ Sources and required settings:
   for prerelease naming conventions.
 - `forgejo` or `gitea`: `host` and `repo=owner/name`; first published stable
   release in API order.
+- `gitlab-tags`: `host` and `repo`; tags ordered by update time descending.
+- `forgejo-tags` or `gitea-tags`: `host` and `repo`; first eligible tag in API order.
+- `github-commit`, `gitlab-commit`, `forgejo-commit`, or `gitea-commit`: `repo`
+  and explicit `branch`, plus `host` for non-GitHub sources. Returns the branch
+  head's full commit ID, never a shortened ID. No default branch or tag lookup.
+  For example, `source=github-commit`, `repo=neovim/neovim`, and `branch=master`.
+  Branch names are URL-encoded as a single path parameter.
 - `regex`: `url` and `pattern`; first capture group of the first POSIX ERE match.
   For example, `pattern=version=([0-9]+[.][0-9]+)` extracts from text such as
   `version=1.2`. Matching does not use `REG_NEWLINE`.
@@ -95,9 +102,23 @@ credentials in their query strings, which are included in saved state identity.
 GitHub does not support a custom host.
 
 Optional `include_regex` and `exclude_regex` filter raw candidates before
-`prefix` removes one literal leading occurrence. Lists use the first eligible
+`prefix` removes one literal leading occurrence. By default, lists use the first eligible
 candidate; rejecting a single-result source does not trigger another search.
-Empty identifiers, control characters, invalid UTF-8, and NUL regex bodies fail.
+Commit sources apply filters to the full ID and reject `prefix` to preserve it.
+`branch` is rejected on other sources. Empty identifiers, control characters,
+invalid UTF-8, and NUL regex bodies fail.
+
+Tag sources alone accept `sort = numeric` to select the greatest eligible tag
+across all pages instead of the first in API order. After raw filters and literal
+prefix removal, every eligible identifier must match `[0-9]+([.][0-9]+)*` using
+ASCII digits; a nonnumeric identifier fails the check. Components are nonnegative
+integers of any length within response limits, compared left to right without
+integer conversion. Leading zeros do not matter; missing trailing components
+are zero, so `01.2`, `1.2.0`, and `1.2` tie. The first encountered spelling wins
+a tie and is preserved after prefix removal. This is not semantic versioning.
+Releases, commits, and regex sources reject `sort`; no other value is supported.
+For example, `sort = numeric` with `prefix = v` selects `17.0` over `16.2` even
+when `v16.2` appears first. Changing this option invalidates saved observations.
 
 INI names and keys are case-sensitive. Duplicate sections or keys, unknown keys,
 missing values, and unsupported sources fail before requests begin. Full-line
@@ -113,7 +134,8 @@ anonymous access. Token values are never saved or printed.
 
 TLS verification is enabled and redirects are rejected. Requests have a 10-second
 connection timeout, a 30-second total timeout, and a 1 MiB response limit.
-Pagination searches at most 100 pages in API order, not greatest-version order.
+Pagination searches at most 100 pages. Numeric selection scans every page and
+fails if another page is indicated at the cap, without printing an incomplete maximum.
 There are no retries, caches, or separate regex CPU deadlines. Standard libcurl
 proxy environment variables apply.
 
