@@ -9,10 +9,10 @@ WARNINGS = -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 
 all: nvc
 
-nvc: nvc.c
+nvc: nvc.c source.inc state.inc
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c17 $(WARNINGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-nvc-test: nvc.c
+nvc-test: nvc.c source.inc state.inc
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c17 $(WARNINGS) -DNVC_TEST $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 test: nvc nvc-test

@@ -112,6 +112,9 @@ class NvcTests(unittest.TestCase):
         environment.update(NVC_TEST_URL=self.fixture.url, NVC_TEST_TIMEOUT_MS="2000")
         environment.update(env or {})
         command = [BINARY]
+        args = list(args)
+        if args and args[0] in ("check", "compare", "accept"):
+            command.append(args.pop(0))
         if use_config:
             command += ["-c", str(self.path)]
         return subprocess.run(command + list(args), env=environment, capture_output=True, timeout=10)
@@ -409,6 +412,169 @@ class NvcTests(unittest.TestCase):
                 self.assertNotIn(b"secret", result.stderr)
                 self.assertNotIn(b"suffix", result.stderr)
                 self.assert_no_network()
+
+    def state_args(self, command, *names):
+        return (command, "-s", str(Path(self.directory.name) / "state.json"), *names)
+
+    def test_sources_filters_and_prefix(self):
+        cases = [
+            ("github-tags", "", "/repos/owner/good/tags?per_page=100&page=1", [{"name": "skip"}, {"name": "vv2"}]),
+            ("gitlab", "host=https://gitlab.example:8443\n", "/api/v4/projects/owner%2Fgood/releases?order_by=released_at&sort=desc&per_page=100&page=1", [{"tag_name": "vv0", "upcoming_release": True}, {"tag_name": "vv2"}]),
+            ("forgejo", "host=https://forge.example:8443\n", "/api/v1/repos/owner/good/releases?draft=false&pre-release=false&limit=100&page=1", [dict(tag_name="vv0", draft=True, prerelease=False), dict(tag_name="vv2", draft=False, prerelease=False)]),
+            ("gitea", "host=https://forge.example\n", "/api/v1/repos/owner/good/releases?draft=false&pre-release=false&limit=100&page=1", [dict(tag_name="vv2", draft=False, prerelease=False)]),
+        ]
+        for source, host, route, body in cases:
+            with self.subTest(source=source):
+                self.fixture.requests.clear()
+                self.fixture.routes[route] = (200, json.dumps(body).encode(), {})
+                text = f"[good]\nsource={source}\nrepo=owner/good\n{host}include_regex=^vv\nexclude_regex=0$\nprefix=v\n"
+                result = self.run_nvc(text, env={"GITHUB_TOKEN": "github-only"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, b"good\tv2\n")
+                if source != "github-tags":
+                    self.assertNotIn("Authorization", self.fixture.requests[0][1])
+
+    def test_pagination_and_regex(self):
+        self.fixture.routes["/repos/owner/good/tags?per_page=100&page=1"] = (200, json.dumps([{"name": "skip"}] * 100).encode(), {})
+        self.fixture.routes["/repos/owner/good/tags?per_page=100&page=2"] = (200, b'[{"name":"v2"}]', {})
+        result = self.run_nvc("[good]\nsource=github-tags\nrepo=owner/good\ninclude_regex=^v\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"good\tv2\n")
+        self.fixture.routes["/versions"] = (200, b"release=v2 release=v3", {})
+        text = "[good]\nsource=regex\nurl=https://example.org/versions\npattern=release=(v[0-9]+)\nprefix=v\n"
+        result = self.run_nvc(text)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"good\t2\n")
+        for body in (b"release=v2\x00hidden", b"nothing"):
+            self.fixture.routes["/versions"] = (200, body, {})
+            self.assert_failure(self.run_nvc(text))
+
+    def test_source_configuration_security(self):
+        for host in ("http://example.org", "https://user:secret@example.org", "https://example.org/#x", "https://example.org?x", "https://example.org/path", "https://"):
+            self.assert_failure(self.run_nvc(f"[good]\nsource=forgejo\nrepo=owner/good\nhost={host}\n"))
+            self.assert_no_network()
+        for expression in ("[", "no-capture"):
+            self.assert_failure(self.run_nvc(f"[good]\nsource=regex\nurl=https://example.org/versions\npattern={expression}\n"))
+            self.assert_no_network()
+        route = "/api/v1/repos/owner/good/releases?draft=false&pre-release=false&limit=100&page=1"
+        self.fixture.routes[route] = (200, b'[{"tag_name":"v1","draft":false,"prerelease":false}]', {})
+        result = self.run_nvc("[good]\nsource=forgejo\nrepo=owner/good\nhost=https://example.org:8443\ntoken_env=FORGE_TOKEN\n", env={"FORGE_TOKEN": "forge-secret", "GITHUB_TOKEN": "github-secret"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fixture.requests[-1][1]["Authorization"], "Bearer forge-secret")
+        self.assertNotIn(b"secret", result.stdout + result.stderr)
+
+    def test_short_page_markers_and_page_bound(self):
+        cases = [
+            ("github-tags", "", "/repos/owner/good/tags?per_page=100&page=", {"name": "skip"}, {"name": "v2"}, {"Link": '<https://evil.example/page>; rel="next"'}),
+            ("gitlab", "host=https://example.org\n", "/api/v4/projects/owner%2Fgood/releases?order_by=released_at&sort=desc&per_page=100&page=", {"tag_name": "skip"}, {"tag_name": "v2"}, {"X-Next-Page": "2"}),
+            ("forgejo", "host=https://example.org\n", "/api/v1/repos/owner/good/releases?draft=false&pre-release=false&limit=100&page=", dict(tag_name="skip", draft=False, prerelease=False), dict(tag_name="v2", draft=False, prerelease=False), {"Link": '<https://evil.example/page>; rel="next"'}),
+        ]
+        for source, host, route, first, last, headers in cases:
+            with self.subTest(source=source):
+                self.fixture.requests.clear()
+                self.fixture.routes[route + "1"] = (200, json.dumps([first]).encode(), headers)
+                self.fixture.routes[route + "2"] = (200, json.dumps([last]).encode(), {})
+                result = self.run_nvc(f"[good]\nsource={source}\nrepo=owner/good\n{host}include_regex=^v\n")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, b"good\tv2\n")
+                self.assertEqual([r[0] for r in self.fixture.requests], [route + "1", route + "2"])
+        route = "/repos/owner/good/tags?per_page=100&page="
+        for page in range(1, 101):
+            self.fixture.routes[route + str(page)] = (200, b'[{"name":"skip"}]', {"Link": '<https://example.org/next>; rel="next"'})
+        self.fixture.requests.clear()
+        self.assert_failure(self.run_nvc("[good]\nsource=github-tags\nrepo=owner/good\ninclude_regex=^v\n"), pattern="100 pages")
+        self.assertEqual(len(self.fixture.requests), 100)
+
+    def test_state_accept_atomic_selection_and_no_credentials(self):
+        self.fixture.add("first")
+        self.fixture.add("second", status=500)
+        text = config("first", "second")
+        self.assert_failure(self.run_nvc(text, self.state_args("check"), env={"GITHUB_TOKEN": "never-persist-token"}))
+        state = Path(self.directory.name) / "state.json"
+        previous = state.read_bytes()
+        self.assertNotIn(b"never-persist-token", previous)
+        self.assert_failure(self.run_nvc(args=self.state_args("accept")))
+        self.assertEqual(state.read_bytes(), previous)
+        self.assertEqual(self.run_nvc(args=self.state_args("accept", "first")).returncode, 0)
+        self.assertEqual(json.loads(state.read_text())["entries"]["first"]["accepted"], "v1.2.3")
+
+    def test_state_workflow_failures_and_identity(self):
+        self.fixture.add("good", release("v1"))
+        text = config("good")
+        result = self.run_nvc(text, self.state_args("check"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_nvc(args=self.state_args("compare"))
+        self.assertEqual(result.stdout, b"good\tnew\t\tv1\n")
+        self.assertEqual(self.run_nvc(args=self.state_args("accept")).returncode, 0)
+        self.assertEqual(self.run_nvc(args=self.state_args("compare")).stdout, b"good\tunchanged\tv1\tv1\n")
+        self.fixture.add("good", release("v2"))
+        self.assertEqual(self.run_nvc(args=self.state_args("check")).returncode, 0)
+        self.assertEqual(self.run_nvc(args=self.state_args("compare")).stdout, b"good\tchanged\tv1\tv2\n")
+        self.fixture.add("good", status=500)
+        self.assert_failure(self.run_nvc(args=self.state_args("check")))
+        result = self.run_nvc(args=self.state_args("compare"))
+        self.assert_failure(result)
+        self.assertEqual(result.stdout, b"good\tfailed\tv1\tv2\n")
+        self.assert_failure(self.run_nvc(args=self.state_args("accept")))
+        self.assert_failure(self.run_nvc(text + "prefix=v\n", self.state_args("accept")))
+        self.assertEqual(self.run_nvc(args=self.state_args("compare")).stdout, b"good\tunchecked\t\t\n")
+        state = json.loads((Path(self.directory.name) / "state.json").read_text())
+        self.assertEqual(state["entries"]["good"]["pending"], "v2")
+        self.assertFalse(state["entries"]["good"]["eligible"])
+
+    def test_state_malformed_and_interrupted(self):
+        self.fixture.add("good")
+        state = Path(self.directory.name) / "state.json"
+        for body in ('{', '{}', '{"format":2,"entries":{}}', '{"format":1,"entries":[]}', '{"format":1,"format":1,"entries":{}}', '{"format":1,"entries":{"a\\u0000b":{}}}'):
+            state.write_text(body)
+            self.assert_failure(self.run_nvc(config("good"), self.state_args("check")))
+            self.assertEqual(state.read_text(), body)
+        state.unlink()
+        self.assertEqual(self.run_nvc(args=self.state_args("check")).returncode, 0)
+        previous = state.read_bytes()
+        self.fixture.add("good", release("v2"))
+        result = self.run_nvc(args=self.state_args("check"), env={"NVC_TEST_STATE_INTERRUPT": "1"})
+        self.assertEqual(result.returncode, 99)
+        self.assertEqual(state.read_bytes(), previous)
+        self.assertEqual(self.run_nvc(args=self.state_args("check")).returncode, 0)
+
+    def test_offline_commands_ignore_tokens_and_missing_state(self):
+        self.path.write_text(config("good"))
+        result = self.run_nvc(args=self.state_args("compare"), env={"GITHUB_TOKEN": "invalid token"})
+        self.assert_failure(result)
+        self.assertEqual(result.stdout, b"good\tunchecked\t\t\n")
+        self.assert_no_network()
+        self.fixture.add("good")
+        self.assertEqual(self.run_nvc(args=self.state_args("check")).returncode, 0)
+        result = self.run_nvc(args=self.state_args("accept"), env={"GITHUB_TOKEN": "invalid token"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_truncated_state_corpus(self):
+        self.path.write_text(config("good"))
+        state = Path(self.directory.name) / "state.json"
+        document = '{"format":1,"entries":{"good":{"identity":["github",null,null,null,null,null,null,null,null],"accepted":null,"pending":null,"eligible":false}}}'
+        for length in range(len(document)):
+            body = document[:length]
+            state.write_text(body)
+            result = self.run_nvc(args=self.state_args("accept"))
+            self.assert_failure(result)
+            self.assertEqual(state.read_text(), body)
+
+    def test_state_concurrent_disjoint_merge_and_removed(self):
+        self.fixture.add("first", delay=0.1)
+        self.fixture.add("second", delay=0.1)
+        self.path.write_text(config("first", "second"))
+        state = Path(self.directory.name) / "state.json"
+        env = os.environ.copy()
+        env.pop("GITHUB_TOKEN", None)
+        env.update(NVC_TEST_URL=self.fixture.url, NVC_TEST_TIMEOUT_MS="2000")
+        processes = [subprocess.Popen([BINARY, "check", "-c", str(self.path), "-s", str(state), name], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for name in ("first", "second")]
+        for proc in processes:
+            out, err = proc.communicate(timeout=10)
+            self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(set(json.loads(state.read_text())["entries"]), {"first", "second"})
+        self.assertEqual(self.run_nvc(config("first"), self.state_args("accept")).returncode, 0)
+        self.assertIn("second", json.loads(state.read_text())["entries"])
 
 
 if __name__ == "__main__":
