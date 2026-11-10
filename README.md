@@ -1,80 +1,62 @@
 # nvc
 
-A minimal nv checker in C
+A minimal nv checker in C.
 
-## Description
-
-nvc checks upstream versions from an INI configuration file. It uses concurrent
-HTTP requests and writes results as tab-separated text for use in scripts.
-
-Currently, nvc supports GitHub releases. It reports release tags unchanged,
-without version sorting, normalization, or comparison with previous runs.
-
-## Requirements
-
-- A C17 compiler
-- Make and pkg-config
-- libcurl 7.85.0 or later
-- json-c 0.15 or later
-- Python 3, for tests only
-
-The code requires POSIX interfaces and `getopt_long`. A working CA certificate
-store is required for HTTPS requests.
+nvc checks upstream versions from INI files using concurrent HTTP requests.
+It supports GitHub releases and tags, GitLab releases, Forgejo/Gitea releases,
+and regex extraction from public HTTPS pages. Versions are opaque strings;
+nvc does not sort them numerically.
 
 ## Building
 
+Requires a C17 compiler, Make, pkg-config, libcurl 7.85.0+, json-c 0.15+,
+POSIX interfaces with `getopt_long`, and a CA certificate store.
+Tests also require Python 3.
+
 ```sh
 make
+make test
 ```
 
-The executable is written to `./nvc`. Run it from the build directory or copy it
-to a directory in your `PATH`. There is no install target.
-
-The Makefile accepts `CC`, `CPPFLAGS`, `CFLAGS`, `LDFLAGS`, `LDLIBS`, and
-`PKG_CONFIG`. Clean the build before changing compiler options:
-
-```sh
-make clean
-make CC=clang CFLAGS='-O2 -g'
-```
+The executable is `./nvc`; there is no install target. Standard compiler and
+linker overrides are supported. Run `make clean` before changing build flags.
 
 ## Usage
 
 ```text
 nvc -c file [-j jobs] [project ...]
-nvc -h | --help
-nvc -V | --version
+nvc check -c file -s state [-j jobs] [project ...]
+nvc compare -c file -s state [project ...]
+nvc accept -c file -s state [project ...]
 ```
 
-- `-c file`: Read projects from the specified INI file. This option is required
-  for checks; nvc does not search for a default configuration.
-- `-j jobs`: Set the maximum number of concurrent requests, from 1 through 64.
-  The default is 8.
-- `project ...`: Check only the named configuration sections. With no project
-  arguments, check all sections. Unknown names are errors. Repeated names are
-  checked once.
-- `-h`, `--help`: Display usage information and exit.
-- `-V`, `--version`: Display the program version and exit.
+`-c` and state-command `-s` paths are explicit. Project arguments select section
+names; omitting them selects all projects. Concurrency defaults to 8, with `-j`
+accepting 1–64. Use `--help` or `--version` for program information.
 
-For example:
+Stateless checks and `check` print project and version separated by a tab, in
+configuration order. Errors go to stderr without cancelling other projects.
+`compare` prints project, status, accepted version, and pending version as four
+tab-separated columns. Status is `unchecked`, `failed`, `new`, `changed`, or
+`unchanged`; absent versions are empty.
 
 ```sh
-./nvc -c versions.ini
-./nvc -c versions.ini -j 4 neovim
+./nvc check -c versions.ini -s versions.json
+./nvc compare -c versions.ini -s versions.json
+./nvc accept -c versions.ini -s versions.json neovim
 ```
 
-### Output
+Checks never accept automatically. Acceptance requires a successful observation
+with matching configuration and is all-or-nothing for the selection. Failed
+checks retain the last successful value but make it ineligible for acceptance.
+Changed configuration invalidates old observations. Unselected and removed
+projects remain in state.
 
-Each successful check writes one line to standard output, with the project name
-and release tag separated by a tab. Results follow configuration order,
-regardless of request completion order or the order of project arguments.
-
-Errors are written to standard error. A failed check does not cancel other
-checks; successful results are still printed.
+Exit status is 0 for successful operations, including comparisons showing
+changes. Errors, failed or unchecked observations, and ineligible acceptance
+return nonzero.
 
 ## Configuration
-
-Each section names a project and requires `source` and `repo`:
 
 ```ini
 [curl]
@@ -82,80 +64,68 @@ source = github
 repo = curl/curl
 
 [neovim]
-source = github
+source = github-tags
 repo = neovim/neovim
+include_regex = ^v[0-9]
+exclude_regex = nightly
+prefix = v
+
+[forgejo]
+source = forgejo
+host = https://codeberg.org
+repo = forgejo/forgejo
 ```
 
-`source` must be `github`. `repo` specifies `owner/name`; components may contain
-ASCII letters, digits, dots, underscores, and hyphens.
+Sources and required settings:
 
-Section names and keys are case-sensitive. Duplicate sections, duplicate keys,
-unknown keys, unsupported sources, missing values, and keys outside sections are
-errors. The entire configuration is validated before requests begin.
+- `github`: `repo=owner/name`; latest published stable release, no tag fallback.
+- `github-tags`: `repo=owner/name`; first eligible tag in API order.
+- `gitlab`: `host` and `repo=group/project`, including nested groups; releases
+  ordered by `released_at` descending, skipping upcoming entries. Use filters
+  for prerelease naming conventions.
+- `forgejo` or `gitea`: `host` and `repo=owner/name`; first published stable
+  release in API order.
+- `regex`: `url` and `pattern`; first capture group of the first POSIX ERE match.
+  For example, `pattern=version=([0-9]+[.][0-9]+)` extracts from text such as
+  `version=1.2`. Matching does not use `REG_NEWLINE`.
 
-Blank lines and full-line comments beginning with `#` or `;` are accepted.
-Surrounding spaces and tabs are trimmed from section names, keys, and values.
-Both LF and CRLF line endings are accepted.
+Hosts are HTTPS origins without paths, queries, fragments, or userinfo.
+Regex URLs must be public HTTPS URLs without userinfo or fragments; never put
+credentials in their query strings, which are included in saved state identity.
+GitHub does not support a custom host.
 
-Values are literal text. There are no inline comments, quote or escape
-processing, variable expansion, includes, or multiline values. The configuration
-file must not exceed 1 MiB.
+Optional `include_regex` and `exclude_regex` filter raw candidates before
+`prefix` removes one literal leading occurrence. Lists use the first eligible
+candidate; rejecting a single-result source does not trigger another search.
+Empty identifiers, control characters, invalid UTF-8, and NUL regex bodies fail.
 
-### GitHub releases
+INI names and keys are case-sensitive. Duplicate sections or keys, unknown keys,
+missing values, and unsupported sources fail before requests begin. Full-line
+`#` and `;` comments and LF/CRLF are accepted. Surrounding spaces and tabs are
+trimmed; values have no quoting, escapes, inline comments, or expansion.
 
-The GitHub source uses the API endpoint
-`https://api.github.com/repos/OWNER/REPO/releases/latest`. GitHub determines which
-release is latest; nvc does not select or sort repository tags.
+## Authentication and limits
 
-Drafts and prereleases are rejected. Repositories without a qualifying release
-produce an error, with no fallback to tags. Version identifiers retain prefixes
-such as `v`. Empty identifiers, invalid UTF-8, and control characters are rejected.
+`GITHUB_TOKEN` applies only to GitHub. API sources can select another environment
+variable with `token_env`; regex sources cannot use tokens. GitLab uses
+`PRIVATE-TOKEN`, other APIs Bearer authorization. Empty or unset tokens mean
+anonymous access. Token values are never saved or printed.
 
-Requests verify TLS certificates and hostnames. Redirects are not followed;
-update `repo` if a renamed or transferred repository redirects. Each request has
-a 10-second connection timeout, a 30-second total timeout, and a 1 MiB response
-limit. Requests are not retried or cached.
+TLS verification is enabled and redirects are rejected. Requests have a 10-second
+connection timeout, a 30-second total timeout, and a 1 MiB response limit.
+Pagination searches at most 100 pages in API order, not greatest-version order.
+There are no retries, caches, or separate regex CPU deadlines. Standard libcurl
+proxy environment variables apply.
 
-HTTP 403 may indicate a rate limit or insufficient permissions. HTTP 429 indicates
-rate limiting.
+Configuration and state are each limited to 1 MiB. Keep state in a trusted local
+directory with working POSIX locks and atomic rename. Do not remove its `.lock`
+file while nvc runs. Interrupted writes can leave `.tmp.*` files; remove them
+only when no nvc process is running.
 
-## Environment
-
-`GITHUB_TOKEN` is an optional token used to authenticate GitHub API requests. An
-unset or empty value uses anonymous access. Tokens must contain printable ASCII
-without whitespace. Tokens are not read from the configuration file or printed
-in diagnostics.
-
-Standard proxy environment variables supported by libcurl apply to production
-requests.
-
-## Exit status
-
-nvc exits with status 0 when all selected checks succeed. Help and version
-requests also exit with status 0. Invalid arguments, configuration errors, failed
-checks, and output errors return a nonzero status.
-
-## Testing
-
-```sh
-make test
-```
-
-Tests use local HTTP fixtures and do not require GitHub access or credentials.
-The test executable has compile-time fixture support that is not present in the
-production executable.
-
-To run with AddressSanitizer and UndefinedBehaviorSanitizer:
-
-```sh
-make clean
-make CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined' \
-    LDFLAGS='-fsanitize=address,undefined' test
-```
-
-Run `make clean` before returning to a normal build.
+Tests use local fixtures without upstream access or real credentials.
+See [DESIGN.md](DESIGN.md) for persistence details and API references.
 
 ## License
 
-nvc is distributed under the BSD 3-Clause License. See [LICENSE](LICENSE) for the
-full terms.
+nvc is distributed under the BSD 3-Clause License.
+See [LICENSE](LICENSE) for the full terms.
