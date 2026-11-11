@@ -1,21 +1,155 @@
-static struct json_object *parse_json(const char *body, size_t len)
+static int json_code_unit(const char *p)
 {
+	int code = 0;
+	for (unsigned i = 0; i < 4; i++) {
+		int c = (unsigned char)p[i], digit;
+		if (c >= '0' && c <= '9')
+			digit = c - '0';
+		else if (c >= 'a' && c <= 'f')
+			digit = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F')
+			digit = c - 'A' + 10;
+		else
+			return -1;
+		code = code * 16 + digit;
+	}
+	return code;
+}
+
+static const char *json_string_end(const char *p)
+{
+	for (p++; *p != '"'; p++) {
+		if ((unsigned char)*p < 32)
+			return NULL;
+		if (*p != '\\')
+			continue;
+		p++;
+		if (!*p)
+			return NULL;
+		if (*p != 'u')
+			continue;
+		int code = json_code_unit(p + 1);
+		if (code < 0 || (code >= 0xdc00 && code <= 0xdfff))
+			return NULL;
+		p += 4;
+		if (code >= 0xd800 && code <= 0xdbff) {
+			if (p[1] != '\\' || p[2] != 'u')
+				return NULL;
+			int low = json_code_unit(p + 3);
+			if (low < 0xdc00 || low > 0xdfff)
+				return NULL;
+			p += 6;
+		}
+	}
+	return p + 1;
+}
+
+static const char *json_number_end(const char *p)
+{
+	const char *digits = "0123456789";
+	if (*p == '-')
+		p++;
+	if (*p == '0') {
+		p++;
+	} else {
+		size_t n = strspn(p, digits);
+		if (!n)
+			return NULL;
+		p += n;
+	}
+	if (*p == '.') {
+		size_t n = strspn(++p, digits);
+		if (!n)
+			return NULL;
+		p += n;
+	}
+	if (*p == 'e' || *p == 'E') {
+		p++;
+		if (*p == '+' || *p == '-')
+			p++;
+		size_t n = strspn(p, digits);
+		if (!n)
+			return NULL;
+		p += n;
+	}
+	return p;
+}
+
+static const char *json_value_end(struct json_tokener *tok, const char *p, unsigned depth)
+{
+	p += strspn(p, " \t\r\n");
+	if (depth > JSON_TOKENER_DEFAULT_DEPTH)
+		return NULL;
+	if (*p == '"')
+		return json_string_end(p);
+	if (!strncmp(p, "true", 4) || !strncmp(p, "null", 4))
+		return p + 4;
+	if (!strncmp(p, "false", 5))
+		return p + 5;
+	if (*p != '{' && *p != '[')
+		return json_number_end(p);
+
+	bool object = *p++ == '{';
+	char end = object ? '}' : ']';
+	struct json_object *keys = object ? json_object_new_object() : NULL;
+	if (object && !keys)
+		return NULL;
+	p += strspn(p, " \t\r\n");
+	while (*p != end) {
+		if (object) {
+			const char *start = p;
+			if (*p != '"' || !(p = json_string_end(p)))
+				goto bad;
+			json_tokener_reset(tok);
+			struct json_object *key = json_tokener_parse_ex(tok, start, (int)(p - start));
+			if (!key || json_tokener_get_error(tok) != json_tokener_success) {
+				json_object_put(key);
+				goto bad;
+			}
+			const char *name = json_object_get_string(key);
+			bool valid = !controls(name, (size_t)json_object_get_string_len(key)) &&
+				     !json_object_object_get_ex(keys, name, NULL) &&
+				     !json_object_object_add(keys, name, NULL);
+			json_object_put(key);
+			p += strspn(p, " \t\r\n");
+			if (!valid || *p++ != ':')
+				goto bad;
+		}
+		p = json_value_end(tok, p, depth + 1);
+		if (!p)
+			goto bad;
+		p += strspn(p, " \t\r\n");
+		if (*p == end)
+			break;
+		if (*p++ != ',')
+			goto bad;
+		p += strspn(p, " \t\r\n");
+	}
+	json_object_put(keys);
+	return p + 1;
+bad:
+	json_object_put(keys);
+	return NULL;
+}
+
+static struct json_object *parse_document(const char *body, size_t len)
+{
+	if (!body || !len || len > INT_MAX || memchr(body, 0, len) ||
+	    !utf8_valid((const unsigned char *)body, len))
+		return NULL;
 	struct json_tokener *tok = json_tokener_new();
-	struct json_object *root = NULL;
-	if (!tok || !body || !len || len > INT_MAX || !utf8_valid((const unsigned char *)body, len))
-		goto done;
+	if (!tok)
+		return NULL;
 	json_tokener_set_flags(tok, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
-	root = json_tokener_parse_ex(tok, body, (int)len);
-	size_t end = json_tokener_get_parse_end(tok);
-	while (end < len && body[end] && strchr(" \t\r\n", body[end]))
-		end++;
-	if (json_tokener_get_error(tok) != json_tokener_success || end != len) {
+	struct json_object *root = json_tokener_parse_ex(tok, body, (int)len);
+	const char *end = NULL;
+	if (root && json_tokener_get_error(tok) == json_tokener_success)
+		end = json_value_end(tok, body, 0);
+	if (!end || end + strspn(end, " \t\r\n") != body + len) {
 		json_object_put(root);
 		root = NULL;
 	}
-done:
-	if (tok)
-		json_tokener_free(tok);
+	json_tokener_free(tok);
 	return root;
 }
 
@@ -61,9 +195,16 @@ static int candidate(struct project *p, const char *value, size_t len)
 {
 	if (!len || controls(value, len) || !utf8_valid((const unsigned char *)value, len))
 		return -1;
-	if ((p->include_ready && regexec(&p->include_re, value, 0, NULL, 0)) ||
-	    (p->exclude_ready && !regexec(&p->exclude_re, value, 0, NULL, 0)))
-		return 0;
+	if (p->include_ready) {
+		int rc = regexec(&p->include_re, value, 0, NULL, 0);
+		if (rc)
+			return rc == REG_NOMATCH ? 0 : -1;
+	}
+	if (p->exclude_ready) {
+		int rc = regexec(&p->exclude_re, value, 0, NULL, 0);
+		if (rc != REG_NOMATCH)
+			return rc ? -1 : 0;
+	}
 	if (p->prefix && !strncmp(value, p->prefix, strlen(p->prefix)))
 		value += strlen(p->prefix);
 	if (!*value)
@@ -105,7 +246,7 @@ static void source_parse(struct project *p)
 			error = result ? "invalid version identifier" : "no matching candidate";
 		goto done;
 	}
-	root = parse_json(p->body, p->len);
+	root = parse_document(p->body, p->len);
 	if (p->type->operation == COMMIT) {
 		struct json_object *commit;
 		if (!root || !json_object_is_type(root, json_type_object) ||
@@ -126,7 +267,7 @@ static void source_parse(struct project *p)
 	if (!root || !json_object_is_type(root, github ? json_type_object : json_type_array))
 		goto done;
 	size_t count = github ? 1 : json_object_array_length(root);
-	if (!github && count > 100)
+	if (!github && count > PAGE_SIZE)
 		goto done;
 	for (size_t i = 0; i < count; i++) {
 		item = github ? root : json_object_array_get_idx(root, i);
@@ -167,16 +308,8 @@ static void source_parse(struct project *p)
 			goto done;
 		}
 	}
-	if (!github && (count == 100 || p->next_page)) {
-		if (p->page >= 100)
-			error = "pagination exceeds 100 pages";
-		else {
-			p->more = true;
-			error = NULL;
-		}
-	} else if (p->sort && p->version)
-		error = NULL;
-	else
+	error = github ? NULL : pagination(p, count);
+	if (!error && !p->more && !(p->sort && p->version))
 		error = tags ? "no matching tag" : "no matching stable candidate";
 done:
 	if (error)

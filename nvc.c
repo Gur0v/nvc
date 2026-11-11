@@ -19,6 +19,8 @@
 #define VERSION "0.1.0"
 #define RESPONSE_MAX (1024 * 1024)
 #define CONFIG_MAX (1024 * 1024)
+#define PAGE_SIZE 100U
+#define PAGE_MAX 100U
 
 struct project {
 	char *name;
@@ -31,7 +33,7 @@ struct project {
 	bool extract_ready, include_ready, exclude_ready;
 	unsigned page;
 	bool more;
-	bool next_page;
+	size_t items_seen, items_total;
 	struct curl_slist *headers;
 	bool selected;
 	CURL *easy;
@@ -142,17 +144,26 @@ static char *trim(char *s)
 	return s;
 }
 
-static bool repo_valid(const char *s)
+static bool repo_valid(const char *s, bool nested)
 {
-	const char *slash = strchr(s, '/');
-
-	if (!slash || slash == s || !slash[1] || strchr(slash + 1, '/'))
+	if (!s)
 		return false;
-	for (const char *p = s; *p; p++)
-		if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-		      (*p >= '0' && *p <= '9') || strchr("-._/", *p)))
+	unsigned separators = 0;
+	const char *start = s;
+	for (const char *p = s; ; p++) {
+		if (*p == '/' || !*p) {
+			size_t len = (size_t)(p - start);
+			if (!len || (len == 1 && *start == '.') ||
+			    (len == 2 && !memcmp(start, "..", 2)))
+				return false;
+			if (!*p)
+				return separators && (nested || separators == 1);
+			separators++;
+			start = p + 1;
+		} else if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+			     (*p >= '0' && *p <= '9') || strchr("-._", *p)))
 			return false;
-	return strcmp(slash + 1, ".") && strcmp(slash + 1, "..");
+	}
 }
 
 static void config_free(struct config *cfg)
@@ -210,6 +221,7 @@ static int config_read(struct config *cfg, const char *path)
 		n = 0;
 		while ((ch = fgetc(file)) != EOF) {
 			if (++total > CONFIG_MAX) {
+				number++;
 				error = "configuration exceeds 1 MiB";
 				break;
 			}
@@ -227,6 +239,10 @@ static int config_read(struct config *cfg, const char *path)
 		}
 		if (memchr(line, '\0', n)) {
 			error = "NUL byte in configuration";
+			break;
+		}
+		if (!utf8_valid((const unsigned char *)line, n)) {
+			error = "configuration is not UTF-8";
 			break;
 		}
 		if (n && line[n - 1] == '\n')
@@ -357,47 +373,24 @@ static int config_read(struct config *cfg, const char *path)
 		bool regex = p->type->operation == EXTRACT;
 		if ((p->sort && (p->type->operation != TAGS || strcmp(p->sort, "numeric"))) ||
 		    ((p->type->operation == COMMIT) != (p->branch != NULL)) ||
-		    ((p->type->operation == COMMIT) && (p->prefix || !strcmp(p->branch, ".") ||
-				   !strcmp(p->branch, "..") || !utf8_valid((const unsigned char *)p->branch,
-							 strlen(p->branch)))) ||
+		    (p->branch && (p->prefix || !strcmp(p->branch, ".") || !strcmp(p->branch, ".."))) ||
 		    (regex ? (!p->url || !p->regex || p->repo || p->host || p->token_env)
-			   : (!p->repo || p->url || p->regex ||
-			      (github ? p->host != NULL : !p->host))) ||
-		    (!regex && !gitlab && !repo_valid(p->repo)))
+			   : (p->url || p->regex || (github ? p->host != NULL : !p->host) ||
+			      !repo_valid(p->repo, gitlab) || (gitlab && strstr(p->repo, "..")))))
 			goto invalid;
-		if (gitlab) {
-			if (!p->repo || !strchr(p->repo, '/') || p->repo[0] == '/' ||
-			    strstr(p->repo, ".."))
-				goto invalid;
-			for (const char *r = p->repo; *r; r++)
-				if (!isalnum((unsigned char)*r) && !strchr("-._/", *r))
-					goto invalid;
-		}
 		if (p->host || p->url) {
 			const char *value = p->host ? p->host : p->url;
+			if (strncmp(value, "https://", 8) || value[8] == '/' || strchr(value, '#') ||
+			    (p->host && strpbrk(value + 8, "/?")))
+				goto invalid;
 			CURLU *u = curl_url();
-			char *scheme = NULL, *host = NULL, *part = NULL;
-			bool valid = !strncmp(value, "https://", 8) && u &&
-				     curl_url_set(u, CURLUPART_URL, value, 0) == CURLUE_OK &&
-				     curl_url_get(u, CURLUPART_SCHEME, &scheme, 0) == CURLUE_OK &&
-				     !strcmp(scheme, "https") &&
-				     curl_url_get(u, CURLUPART_HOST, &host, 0) == CURLUE_OK;
-			if (u) {
-				if (curl_url_get(u, CURLUPART_USER, &part, 0) == CURLUE_OK)
-					valid = false;
-				curl_free(part);
-				part = NULL;
-				if (curl_url_get(u, CURLUPART_FRAGMENT, &part, 0) == CURLUE_OK)
-					valid = false;
-				curl_free(part);
-				part = NULL;
-				if (valid && p->host && (strchr(value + 8, '/') || strchr(value + 8, '?')))
-					valid = false;
+			if (!u) {
+				fprintf(stderr, "nvc: %s: cannot allocate URL handle\n", p->name);
+				return -1;
 			}
-			curl_free(scheme);
-			curl_free(host);
+			CURLUcode result = curl_url_set(u, CURLUPART_URL, value, CURLU_DISALLOW_USER);
 			curl_url_cleanup(u);
-			if (!valid)
+			if (result != CURLUE_OK)
 				goto invalid;
 		}
 		if (p->token_env) {
@@ -468,36 +461,154 @@ static size_t body_write(char *data, size_t size, size_t count, void *arg)
 	return n;
 }
 
-#include "source.inc"
+static bool has_next_relation(const char *s, const char *end, bool quoted)
+{
+	size_t matched = 0;
+	for (; s < end; s++) {
+		if (quoted && *s == '\\')
+			s++;
+		unsigned char c = (unsigned char)*s;
+		if (c == ' ' || c == '\t') {
+			if (matched == 4)
+				return true;
+			matched = 0;
+		} else if (matched < 4 && tolower(c) == "next"[matched]) {
+			matched++;
+		} else {
+			matched = 5;
+		}
+	}
+	return matched == 4;
+}
+
+static bool link_has_next(const char *s)
+{
+	while (*(s += strspn(s, ", \t"))) {
+		if (*s++ != '<' || !(s = strchr(s, '>')))
+			return false;
+		s++;
+		bool rel_seen = false, next = false, anchored = false;
+		while (*(s += strspn(s, " \t")) == ';') {
+			s++;
+			s += strspn(s, " \t");
+			const char *name = s;
+			size_t len = strcspn(s, "=;, \t");
+			if (!len)
+				return false;
+			s += len;
+			bool rel = len == 3 && !strncasecmp(name, "rel", 3);
+			anchored |= len == 6 && !strncasecmp(name, "anchor", 6);
+			s += strspn(s, " \t");
+			const char *value = s, *end = s;
+			bool quoted = false;
+			if (*s == '=') {
+				s++;
+				s += strspn(s, " \t");
+				quoted = *s == '"';
+				if (quoted) {
+					value = ++s;
+					while (*s && *s != '"') {
+						if (*s++ == '\\' && *s)
+							s++;
+					}
+					end = s;
+					if (*s++ != '"')
+						return false;
+				} else {
+					value = s;
+					s += strcspn(s, ";, \t");
+					end = s;
+					if (value == end)
+						return false;
+				}
+			}
+			if (rel && !rel_seen)
+				next = has_next_relation(value, end, quoted);
+			rel_seen |= rel;
+		}
+		if (*s && *s != ',')
+			return false;
+		if (next && !anchored)
+			return true;
+	}
+	return false;
+}
+
+static bool page_number(const char *s, size_t *number)
+{
+	if (*s < '0' || *s > '9')
+		return false;
+	size_t value = 0;
+	for (; *s >= '0' && *s <= '9'; s++) {
+		unsigned digit = (unsigned)(*s - '0');
+		value = value > (SIZE_MAX - digit) / 10 ? SIZE_MAX : value * 10 + digit;
+	}
+	*number = value;
+	return !*s;
+}
+
+static const char *pagination(struct project *p, size_t count)
+{
+	struct curl_header *h;
+	CURLHcode code = curl_easy_header(p->easy, "Link", 0, CURLH_HEADER, -1, &h);
+	if (code == CURLHE_NOT_BUILT_IN)
+		return "libcurl header API unavailable";
+	if (code != CURLHE_OK && code != CURLHE_MISSING && code != CURLHE_NOHEADERS)
+		return "cannot read pagination headers";
+
+	bool next = count == PAGE_SIZE, has_total = false;
+	size_t total = 0;
+	h = NULL;
+	while ((h = curl_easy_nextheader(p->easy, CURLH_HEADER, -1, h))) {
+		size_t n;
+		if (!strcasecmp(h->name, "Link")) {
+			next |= link_has_next(h->value);
+		} else if (!strcasecmp(h->name, "X-Next-Page")) {
+			if (page_number(h->value, &n) && n)
+				next = true;
+		} else if ((!strcasecmp(h->name, "X-Total-Count") ||
+			    (p->type->provider == GITLAB && !strcasecmp(h->name, "X-Total"))) &&
+			   page_number(h->value, &n)) {
+			if (n > total)
+				total = n;
+			has_total = true;
+		}
+	}
+	if (has_total)
+		p->items_total = total;
+	p->items_seen += count;
+	if (!next && p->items_seen >= p->items_total)
+		return NULL;
+	if (!count)
+		return "empty page before pagination ended";
+	if (p->page == PAGE_MAX)
+		return "pagination exceeds 100 pages";
+	p->more = true;
+	return NULL;
+}
 
 static size_t header_read(char *data, size_t size, size_t count, void *arg)
 {
 	struct project *p = arg;
+	(void)data;
 	if (size && count > SIZE_MAX / size)
 		return 0;
 	size_t n = size * count;
-	if (n > 8192)
+	if (n > 8192) {
+		snprintf(p->error, sizeof(p->error), "response header exceeds 8 KiB");
 		return 0;
-	if (n > 5 && !strncasecmp(data, "Link:", 5)) {
-		char line[8193];
-		memcpy(line, data, n);
-		line[n] = 0;
-		if (strstr(line, "rel=\"next\"") || strstr(line, "rel=next"))
-			p->next_page = true;
-	}
-	if (n > 12 && !strncasecmp(data, "X-Next-Page:", 12)) {
-		for (size_t i = 12; i < n; i++)
-			if (data[i] >= '1' && data[i] <= '9')
-				p->next_page = true;
 	}
 	return n;
 }
 
-static int request_start(CURLM *multi, struct project *p, const char *base, long timeout)
+#include "source.inc"
+
+static int request_start(CURLM *multi, struct project *p, const char *test_base,
+			 long timeout, bool http2)
 {
 	char *url, *escaped;
-	size_t len = strlen(base) + (p->host ? strlen(p->host) : 0) +
-		     (p->repo ? strlen(p->repo) * 3 : 0) +
+	const char *origin = test_base ? test_base : p->host ? p->host : "https://api.github.com";
+	size_t len = strlen(origin) + (p->repo ? strlen(p->repo) * 3 : 0) +
 		     (p->branch ? strlen(p->branch) * 3 : 0) + (p->url ? strlen(p->url) : 0) + 160;
 	CURLcode code = CURLE_OK;
 	CURLMcode mc;
@@ -506,7 +617,6 @@ static int request_start(CURLM *multi, struct project *p, const char *base, long
 		p->body[0] = 0;
 	p->more = false;
 	p->page++;
-	p->next_page = false;
 	url = malloc(len);
 	p->easy = curl_easy_init();
 	if (!url || !p->easy) {
@@ -514,20 +624,15 @@ static int request_start(CURLM *multi, struct project *p, const char *base, long
 		snprintf(p->error, sizeof(p->error), "out of memory");
 		goto fail;
 	}
-	const char *origin = p->host ? p->host : base;
-#ifdef NVC_TEST
-	if (getenv("NVC_TEST_URL"))
-		origin = base;
-#endif
 	if (p->url) {
-		snprintf(url, len, "%s", p->url);
-#ifdef NVC_TEST
-		if (getenv("NVC_TEST_URL")) {
-			const char *path = strchr(p->url + 8, '/');
-			snprintf(url, len, "%s%s", base, path ? path : "/");
+		if (test_base) {
+			const char *path = strpbrk(p->url + 8, "/?");
+			snprintf(url, len, "%s%s%s", origin, path && *path == '/' ? "" : "/",
+				 path ? path : "");
+		} else {
+			snprintf(url, len, "%s", p->url);
 		}
-#endif
-	} else if ((p->type->provider == GITLAB)) {
+	} else if (p->type->provider == GITLAB) {
 		escaped = curl_easy_escape(p->easy, p->repo, 0);
 		char *branch = p->branch ? curl_easy_escape(p->easy, p->branch, 0) : NULL;
 		if (!escaped || (p->branch && !branch)) {
@@ -536,35 +641,39 @@ static int request_start(CURLM *multi, struct project *p, const char *base, long
 			free(url);
 			goto fail;
 		}
-		if ((p->type->operation == COMMIT))
+		if (p->type->operation == COMMIT)
 			snprintf(url, len, "%s/api/v4/projects/%s/repository/branches/%s",
 				 origin, escaped, branch);
-		else
+		else {
+			bool tags = p->type->operation == TAGS;
 			snprintf(url, len,
-				 "%s/api/v4/projects/%s/%s?order_by=%s&sort=desc&per_page=100&page=%u",
-				 origin, escaped, (p->type->operation == TAGS) ? "repository/tags" : "releases",
-				 (p->type->operation == TAGS) ? "updated" : "released_at", p->page);
+				 "%s/api/v4/projects/%s/%s?order_by=%s&sort=desc&per_page=%u&page=%u",
+				 origin, escaped, tags ? "repository/tags" : "releases",
+				 tags ? "updated" : "released_at", PAGE_SIZE, p->page);
+		}
 		curl_free(escaped);
 		curl_free(branch);
-	} else if ((p->type->operation == COMMIT)) {
+	} else if (p->type->operation == COMMIT) {
 		escaped = curl_easy_escape(p->easy, p->branch, 0);
 		if (!escaped) {
 			free(url);
 			goto fail;
 		}
 		snprintf(url, len, "%s%s/repos/%s/branches/%s", origin,
-			 (p->type->provider == GITHUB) ? "" : "/api/v1", p->repo, escaped);
+			 p->type->provider == GITHUB ? "" : "/api/v1", p->repo, escaped);
 		curl_free(escaped);
-	} else if ((p->type->operation == TAGS))
-		snprintf(url, len, "%s%s/repos/%s/tags?%s=100&page=%u", origin,
-			 (p->type->provider == GITHUB) ? "" : "/api/v1", p->repo,
-			 (p->type->provider == GITHUB) ? "per_page" : "limit", p->page);
-	else if ((p->type->provider == GITHUB))
+	} else if (p->type->operation == TAGS) {
+		bool github = p->type->provider == GITHUB;
+		snprintf(url, len, "%s%s/repos/%s/tags?%s=%u&page=%u", origin,
+			 github ? "" : "/api/v1", p->repo, github ? "per_page" : "limit",
+			 PAGE_SIZE, p->page);
+	} else if (p->type->provider == GITHUB) {
 		snprintf(url, len, "%s/repos/%s/releases/latest", origin, p->repo);
-	else
+	} else {
 		snprintf(url, len,
-			 "%s/api/v1/repos/%s/releases?draft=false&pre-release=false&limit=100&page=%u",
-			 origin, p->repo, p->page);
+			 "%s/api/v1/repos/%s/releases?draft=false&pre-release=false&limit=%u&page=%u",
+			 origin, p->repo, PAGE_SIZE, p->page);
+	}
 #define SETOPT(option, value)                                                                      \
 	do {                                                                                       \
 		code = curl_easy_setopt(p->easy, option, value);                                   \
@@ -575,22 +684,20 @@ static int request_start(CURLM *multi, struct project *p, const char *base, long
 	SETOPT(CURLOPT_HTTPHEADER, p->headers);
 	SETOPT(CURLOPT_USERAGENT, "nvc/" VERSION);
 	SETOPT(CURLOPT_WRITEFUNCTION, body_write);
-	SETOPT(CURLOPT_WRITEDATA, p);
+	SETOPT(CURLOPT_WRITEDATA, (void *)p);
 	SETOPT(CURLOPT_HEADERFUNCTION, header_read);
-	SETOPT(CURLOPT_HEADERDATA, p);
-	SETOPT(CURLOPT_PRIVATE, p);
+	SETOPT(CURLOPT_HEADERDATA, (void *)p);
+	SETOPT(CURLOPT_PRIVATE, (void *)p);
 	SETOPT(CURLOPT_CONNECTTIMEOUT_MS, 10000L);
 	SETOPT(CURLOPT_TIMEOUT_MS, timeout);
 	SETOPT(CURLOPT_NOSIGNAL, 1L);
 	SETOPT(CURLOPT_SSL_VERIFYPEER, 1L);
 	SETOPT(CURLOPT_SSL_VERIFYHOST, 2L);
 	SETOPT(CURLOPT_FOLLOWLOCATION, 0L);
-	SETOPT(CURLOPT_PROTOCOLS_STR, "https");
-#ifdef NVC_TEST
-	SETOPT(CURLOPT_PROTOCOLS_STR, "http,https");
-	SETOPT(CURLOPT_PROXY, "");
-#endif
-	if (curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP2)
+	SETOPT(CURLOPT_PROTOCOLS_STR, test_base ? "http" : "https");
+	if (test_base)
+		SETOPT(CURLOPT_PROXY, "");
+	if (http2)
 		SETOPT(CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
 #undef SETOPT
 	free(url);
@@ -611,28 +718,37 @@ fail:
 	return -1;
 }
 
-static int fetch(struct config *cfg, unsigned jobs, const char *token)
+static int fetch(struct config *cfg, unsigned jobs)
 {
 	CURLM *multi = NULL;
-	const char *base = "https://api.github.com";
+	const char *test_base = NULL;
 	long timeout = 30000;
 	size_t cursor = 0;
 	unsigned active = 0;
 	int status = -1;
 	CURLMcode mc = CURLM_OK;
+	const char *error = "cannot allocate HTTP resources";
+	const char *token = NULL;
 
 #ifdef NVC_TEST
-	const char *test_base = getenv("NVC_TEST_URL");
 	const char *test_timeout = getenv("NVC_TEST_TIMEOUT_MS");
-	if (test_base)
-		base = test_base;
-	if (test_timeout)
-		timeout = strtol(test_timeout, NULL, 10);
-#endif
-	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-		fprintf(stderr, "nvc: cannot initialize curl\n");
+	const char *loopback = "http://127.0.0.1:";
+	size_t n, prefix_len = strlen(loopback);
+	test_base = getenv("NVC_TEST_URL");
+	if (!test_base || strncmp(test_base, loopback, prefix_len) ||
+	    !page_number(test_base + prefix_len, &n) || !n || n > 65535) {
+		fprintf(stderr, "nvc: fixture requires a loopback HTTP origin\n");
 		return -1;
 	}
+	if (test_timeout) {
+		if (!page_number(test_timeout, &n) || !n || n > (size_t)timeout) {
+			fprintf(stderr, "nvc: invalid fixture timeout\n");
+			return -1;
+		}
+		timeout = (long)n;
+	}
+#endif
+	bool http2 = (curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP2) != 0;
 	multi = curl_multi_init();
 	if (!multi)
 		goto done;
@@ -640,8 +756,17 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 		struct project *p = &cfg->items[i];
 		if (!p->selected)
 			continue;
-		bool github = (p->type->provider == GITHUB);
-		const char *secret = p->token_env ? getenv(p->token_env) : (github ? token : NULL);
+		const char *secret = NULL;
+		if (p->token_env) {
+			secret = getenv(p->token_env);
+		} else if (p->type->provider == GITHUB) {
+			if (!token) {
+				token = getenv("GITHUB_TOKEN");
+				if (!token)
+					token = "";
+			}
+			secret = token;
+		}
 		p->headers = curl_slist_append(NULL, "Accept: application/json");
 		if (!p->headers)
 			goto done;
@@ -649,9 +774,11 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 			continue;
 		for (const unsigned char *r = (const unsigned char *)secret; *r; r++)
 			if (*r <= 32 || *r >= 127) {
-				fprintf(stderr, "nvc: %s: invalid authentication token\n", p->name);
-				goto done;
+				snprintf(p->error, sizeof(p->error), "invalid authentication token");
+				break;
 			}
+		if (p->error[0])
+			continue;
 		size_t len = strlen(secret) + 32;
 		char *auth = malloc(len);
 		if (!auth)
@@ -668,7 +795,8 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 	while (cursor < cfg->len || active) {
 		while (cursor < cfg->len && active < jobs) {
 			struct project *p = &cfg->items[cursor++];
-			if (p->selected && !request_start(multi, p, base, timeout))
+			if (p->selected && !p->error[0] &&
+			    !request_start(multi, p, test_base, timeout, http2))
 				active++;
 		}
 		int running, pending;
@@ -677,16 +805,21 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 			goto done;
 		CURLMsg *msg;
 		while ((msg = curl_multi_info_read(multi, &pending))) {
-			struct project *p = NULL;
-			long http = 0;
+			char *owner;
 			if (msg->msg != CURLMSG_DONE)
 				continue;
-			curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &p);
-			curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &http);
+			if (curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &owner) != CURLE_OK) {
+				error = "cannot identify completed request";
+				goto done;
+			}
+			struct project *p = (struct project *)owner;
+			long http;
 			if (msg->data.result != CURLE_OK) {
 				if (!p->error[0])
 					snprintf(p->error, sizeof(p->error), "request: %s",
 						 curl_easy_strerror(msg->data.result));
+			} else if (curl_easy_getinfo(p->easy, CURLINFO_RESPONSE_CODE, &http) != CURLE_OK) {
+				snprintf(p->error, sizeof(p->error), "cannot read HTTP status");
 			} else if (http != 200) {
 				snprintf(p->error, sizeof(p->error), "HTTP %ld%s", http,
 					 http == 404   ? ": source item missing or repository not accessible"
@@ -696,10 +829,12 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 			} else {
 				source_parse(p);
 			}
-			curl_multi_remove_handle(multi, p->easy);
+			mc = curl_multi_remove_handle(multi, p->easy);
+			if (mc != CURLM_OK)
+				goto done;
 			curl_easy_cleanup(p->easy);
 			p->easy = NULL;
-			if (p->more && !request_start(multi, p, base, timeout))
+			if (p->more && !request_start(multi, p, test_base, timeout, http2))
 				continue;
 			active--;
 			free(p->body);
@@ -715,9 +850,7 @@ static int fetch(struct config *cfg, unsigned jobs, const char *token)
 	status = 0;
 done:
 	if (status)
-		fprintf(stderr, "nvc: %s\n",
-			mc != CURLM_OK ? curl_multi_strerror(mc)
-				       : "cannot allocate HTTP resources");
+		fprintf(stderr, "nvc: %s\n", mc != CURLM_OK ? curl_multi_strerror(mc) : error);
 	for (size_t i = 0; i < cfg->len; i++) {
 		struct project *p = &cfg->items[i];
 		if (p->easy) {
@@ -728,7 +861,6 @@ done:
 	}
 	if (multi)
 		curl_multi_cleanup(multi);
-	curl_global_cleanup();
 	return status;
 }
 
@@ -736,10 +868,12 @@ done:
 
 static void usage(FILE *out)
 {
-	fputs("Usage: nvc [check|compare|accept] -c FILE [-s STATE] [-j N] [PROJECT ...]\n"
-	      "A minimal nv checker in C\n\n"
+	fputs("Usage: nvc -c FILE [-j N] [PROJECT ...]\n"
+	      "       nvc check -c FILE -s STATE [-j N] [PROJECT ...]\n"
+	      "       nvc compare -c FILE -s STATE [PROJECT ...]\n"
+	      "       nvc accept -c FILE -s STATE [PROJECT ...]\n\n"
 	      "  -c FILE       INI configuration file\n"
-	      "  -s STATE      Explicit state path, required for state commands\n"
+	      "  -s STATE      State file\n"
 	      "  -j N          Concurrent requests, 1-64 (default: 8)\n"
 	      "  -h, --help    Show help\n"
 	      "  -V, --version Show version\n",
@@ -749,7 +883,7 @@ static void usage(FILE *out)
 int main(int argc, char **argv)
 {
 	struct config cfg = {0};
-	const char *path = NULL, *state = NULL, *command = NULL, *token = getenv("GITHUB_TOKEN");
+	const char *path = NULL, *state = NULL, *command = NULL;
 	if (argc > 1 && (!strcmp(argv[1], "check") || !strcmp(argv[1], "compare") ||
 			 !strcmp(argv[1], "accept"))) {
 		command = argv[1];
@@ -772,6 +906,10 @@ int main(int argc, char **argv)
 			path = optarg;
 			break;
 		case 'j': {
+			if (command && strcmp(command, "check")) {
+				fprintf(stderr, "nvc: -j requires a network check\n");
+				return 1;
+			}
 			char *end;
 			long n;
 			errno = 0;
@@ -785,18 +923,32 @@ int main(int argc, char **argv)
 			break;
 		}
 		case 'h':
-			usage(stdout);
-			return 0;
 		case 'V':
-			puts("nvc " VERSION);
+			if (opt == 'h') {
+				usage(stdout);
+			} else {
+#ifdef NVC_TEST
+				puts("nvc-test " VERSION);
+#else
+				puts("nvc " VERSION);
+#endif
+			}
+			if (fflush(stdout) || ferror(stdout)) {
+				fprintf(stderr, "nvc: cannot write stdout\n");
+				return 1;
+			}
 			return 0;
 		default:
 			usage(stderr);
 			return 1;
 		}
 	}
-	if (!path || (!!command != !!state) || (state && !*state)) {
+	if (!path || !*path || (!!command != !!state) || (state && !*state)) {
 		usage(stderr);
+		return 1;
+	}
+	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+		fprintf(stderr, "nvc: cannot initialize curl\n");
 		return 1;
 	}
 	if (config_read(&cfg, path))
@@ -817,7 +969,7 @@ int main(int argc, char **argv)
 		status = state_run(&cfg, state, command);
 		goto done;
 	}
-	if (fetch(&cfg, jobs, token)) {
+	if (fetch(&cfg, jobs)) {
 		if (command) {
 			for (size_t i = 0; i < cfg.len; i++)
 				if (cfg.items[i].selected)
@@ -845,5 +997,6 @@ int main(int argc, char **argv)
 	}
 done:
 	config_free(&cfg);
+	curl_global_cleanup();
 	return status;
 }

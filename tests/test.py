@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -7,7 +8,8 @@ import tempfile
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+from socketserver import ThreadingTCPServer
 
 
 BINARY = None
@@ -22,69 +24,94 @@ def config(*names):
     return "".join(f"[{name}]\nsource = github\nrepo = owner/{name}\n" for name in names)
 
 
+def test_env():
+    env = {key: os.environ[key] for key in ("ASAN_OPTIONS", "UBSAN_OPTIONS", "LSAN_OPTIONS")
+           if key in os.environ}
+    env["LC_ALL"] = "C"
+    return env
+
+
 class Fixture:
     def __init__(self):
         self.routes = {}
         self.requests = []
-        self.active = 0
-        self.peak = 0
+        self.informational = {}
+        self.trailers = {}
         self.lock = threading.Condition()
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            disable_nagle_algorithm = True
+            timeout = 5
+
+            def handle(self):
+                try:
+                    super().handle()
+                except ConnectionResetError:
+                    pass
+
             def log_message(self, *args):
                 pass
 
             def do_GET(self):
                 with fixture.lock:
                     fixture.requests.append((self.path, dict(self.headers)))
-                    fixture.active += 1
-                    fixture.peak = max(fixture.peak, fixture.active)
-                    fixture.lock.notify_all()
                 try:
                     route = fixture.routes.get(self.path, (404, b"not found", {}))
                     if callable(route):
                         route = route()
                     status, body, headers = route
+                    if self.path in fixture.informational:
+                        self.send_response_only(103)
+                        for key, value in fixture.informational[self.path].items():
+                            self.send_header(key, value)
+                        self.end_headers()
                     self.send_response(status)
                     chunks = body if isinstance(body, list) else [body]
-                    self.send_header("Content-Length", str(sum(map(len, chunks))))
+                    trailers = fixture.trailers.get(self.path)
+                    if trailers is None:
+                        self.send_header("Content-Length", str(sum(map(len, chunks))))
+                    else:
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.send_header("Trailer", ", ".join(trailers))
                     self.send_header("Content-Type", "application/json")
                     for key, value in headers.items():
                         self.send_header(key, value)
                     self.end_headers()
                     for chunk in chunks:
+                        if trailers is not None:
+                            if not chunk:
+                                continue
+                            self.wfile.write(f"{len(chunk):x}\r\n".encode())
                         self.wfile.write(chunk)
+                        if trailers is not None:
+                            self.wfile.write(b"\r\n")
                         self.wfile.flush()
                         if len(chunks) > 1:
                             time.sleep(0.001)
+                    if trailers is not None:
+                        self.wfile.write(b"0\r\n")
+                        for key, value in trailers.items():
+                            self.wfile.write(f"{key}: {value}\r\n".encode())
+                        self.wfile.write(b"\r\n")
+                        self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
-                finally:
-                    with fixture.lock:
-                        fixture.active -= 1
-                        fixture.lock.notify_all()
 
-        class Server(ThreadingHTTPServer):
+        class Server(ThreadingTCPServer):
             request_queue_size = 128
 
         self.server = Server(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
-        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
 
-    def add(self, name, body=None, status=200, headers=None, delay=0):
-        response = (status, release() if body is None else body, headers or {})
-        if delay:
-            def delayed():
-                time.sleep(delay)
-                return response
-            response_route = delayed
-        else:
-            response_route = response
-        self.routes[f"/repos/owner/{name}/releases/latest"] = response_route
+    def add(self, name, body=None, status=200, headers=None):
+        self.routes[f"/repos/owner/{name}/releases/latest"] = (
+            status, release() if body is None else body, headers or {}
+        )
 
     def close(self):
         self.server.shutdown()
@@ -100,27 +127,34 @@ class NvcTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "versions.ini"
 
-    def run_nvc(self, text=None, args=(), env=None, use_config=True):
-        if text is not None:
-            self.path.write_bytes(text if isinstance(text, bytes) else text.encode())
-        environment = os.environ.copy()
-        for key in tuple(environment):
-            if key.lower().endswith("_proxy") or key in (
-                "GITHUB_TOKEN", "NVC_TEST_URL", "NVC_TEST_TIMEOUT_MS"
-            ):
-                environment.pop(key)
-        environment.update(NVC_TEST_URL=self.fixture.url, NVC_TEST_TIMEOUT_MS="2000")
-        environment.update(env or {})
-        command = [BINARY]
+    def fixture_env(self, overrides=None):
+        env = test_env()
+        env.update(NVC_TEST_URL=self.fixture.url, NVC_TEST_TIMEOUT_MS="5000")
+        env.update(overrides or {})
+        return env
+
+    def command(self, args, use_config=True):
         args = list(args)
+        command = [BINARY]
         if args and args[0] in ("check", "compare", "accept"):
             command.append(args.pop(0))
         if use_config:
             command += ["-c", str(self.path)]
-        return subprocess.run(command + list(args), env=environment, capture_output=True, timeout=10)
+        return command + args
+
+    def run_nvc(self, text=None, args=(), env=None, use_config=True):
+        if text is not None:
+            self.path.write_bytes(text if isinstance(text, bytes) else text.encode())
+        return subprocess.run(self.command(args, use_config), env=self.fixture_env(env),
+                              capture_output=True, timeout=15)
+
+    def assert_result(self, result, stdout):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stdout, stdout)
 
     def assert_failure(self, result, name=None, pattern=None):
-        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.returncode, 1, result.stderr)
         self.assertTrue(result.stderr.strip())
         if name is not None:
             self.assertIn(name.encode(), result.stderr)
@@ -337,7 +371,9 @@ class NvcTests(unittest.TestCase):
         self.assertEqual(result.stdout, b"good\tv1.2.3\n")
 
     def test_cli_errors(self):
-        cases = [("--unknown",), ("-j",), ("-c",), ("missing",), ("GOOD",)]
+        cases = [("--unknown",), ("-j",), ("-c",), ("-c", ""),
+                 ("-s", "state.json"), ("check",), ("compare",), ("accept",),
+                 ("check", "-s", ""), ("missing",), ("GOOD",)]
         cases += [("-j", value) for value in ("0", "-1", "65", "1x", "1.5", "", "9999999999999999999999999999")]
         for args in cases:
             with self.subTest(args=args):
@@ -360,6 +396,40 @@ class NvcTests(unittest.TestCase):
                 self.assertTrue(result.stdout.strip())
                 self.assertEqual(result.stderr, b"")
                 self.assert_no_network()
+
+    def test_stdout_failures(self):
+        self.fixture.add("good")
+        self.assert_result(self.run_nvc(config("good"), self.state_args("check")),
+                           b"good\tv1.2.3\n")
+        for args in (("--help",), ("--version",), (), self.state_args("compare")):
+            with self.subTest(args=args), open(os.devnull, "rb") as output:
+                result = subprocess.run(self.command(args), env=self.fixture_env(),
+                                        stdout=output, stderr=subprocess.PIPE, timeout=15)
+                self.assert_failure(result, pattern="cannot write stdout")
+
+    def test_json_document_validation(self):
+        body = release("v1")
+        self.fixture.add("good", body)
+        self.assert_result(self.run_nvc(config("good")), b"good\tv1\n")
+        for value in (b'"abc\\\\uD800"', b'"\\uD83D\\uDE00"', b'-1.2e+3',
+                      b'{"key":null,"nested":{"key":null}}', b'[{},[],true,false,null,0]'):
+            with self.subTest(valid=value):
+                self.fixture.add("good", body[:-1] + b',"extra":' + value + b"}")
+                self.assert_result(self.run_nvc(config("good")), b"good\tv1\n")
+        malformed = [body + b"\x00", body + b"{}", body[:-1] + b',"tag_name":"v2"}',
+                     body[:-1] + b',"tag_\\u006eame":"v2"}', body[:-1] + b',"x\\u0000":null}',
+                     body[:-1] + b',"extra":' + b"[" * 64 + b"0" + b"]" * 64 + b"}"]
+        malformed.extend(body[:-1] + b',"extra":' + value + b"}" for value in
+                         (b"NaN", b"Infinity", b"-01", b"1.", b"1.e2", b'"\\uD800"',
+                          b'"\\uDC00"', b'"\\uD800\\u0061"', b'"literal\nnewline"',
+                          b'{"key":null,"key":null}', b"[1,]", b"{\"x\":0,}",
+                          b"/*comment*/1", b"01", b"+1", b"1e+", b"1e"))
+        for data in malformed:
+            with self.subTest(data=data):
+                self.fixture.add("good", data)
+                result = self.run_nvc(config("good"))
+                self.assert_failure(result, "good", "invalid source response")
+                self.assertEqual(result.stdout, b"")
 
     def test_invalid_release_responses(self):
         valid = dict(tag_name="v1", draft=False, prerelease=False)
@@ -417,6 +487,18 @@ class NvcTests(unittest.TestCase):
                 self.assertEqual([r[0] for r in self.fixture.requests], ["/repos/owner/redirect/releases/latest"])
                 self.assertNotIn(b"fixture-secret", result.stderr)
 
+    def test_response_header_size_boundary(self):
+        prefix = "X-Boundary: "
+        for size in (8192, 8193):
+            with self.subTest(size=size):
+                self.fixture.add("good", headers={"X-Boundary": "x" * (size - len(prefix) - 2)})
+                result = self.run_nvc(config("good"))
+                if size == 8192:
+                    self.assert_result(result, b"good\tv1.2.3\n")
+                else:
+                    self.assert_failure(result, "good", "response header exceeds 8 kib")
+                    self.assertEqual(result.stdout, b"")
+
     def test_response_size_boundary(self):
         body = release("boundary")
         self.fixture.add("boundary", body + b" " * (LIMIT - len(body)))
@@ -431,18 +513,32 @@ class NvcTests(unittest.TestCase):
                 self.assertEqual(result.stdout, b"")
 
     def test_timeout_and_partial_success(self):
-        self.fixture.add("slow", delay=0.8)
+        release_slow = threading.Event()
+        self.fixture.routes["/repos/owner/slow/releases/latest"] = (
+            lambda: (200, release(), {}) if release_slow.wait(5) else (500, b"", {})
+        )
         self.fixture.add("good", release("v2"))
-        result = self.run_nvc(config("slow", "good"), env={"NVC_TEST_TIMEOUT_MS": "100"})
+        try:
+            result = self.run_nvc(config("slow", "good"), env={"NVC_TEST_TIMEOUT_MS": "1000"})
+        finally:
+            release_slow.set()
         self.assert_failure(result, "slow", r"timed?\s*out|timeout")
         self.assertEqual(result.stdout, b"good\tv2\n")
         self.assertNotIn(b"good", result.stderr)
 
     def test_partial_failure_preserves_success_order(self):
-        self.fixture.add("first", release("v-first"), delay=0.15)
-        self.fixture.add("bad", b"not json")
+        later_started = threading.Event()
+        self.fixture.routes["/repos/owner/first/releases/latest"] = (
+            lambda: (200, release("v-first"), {}) if later_started.wait(4) else (500, b"", {})
+        )
         self.fixture.add("last", release("v-last"))
-        result = self.run_nvc(config("first", "bad", "last"))
+
+        def bad_response():
+            later_started.set()
+            return 200, b"not json", {}
+
+        self.fixture.routes["/repos/owner/bad/releases/latest"] = bad_response
+        result = self.run_nvc(config("first", "last", "bad"), ("-j", "2"))
         self.assert_failure(result, "bad")
         self.assertEqual(result.stdout, b"first\tv-first\nlast\tv-last\n")
         self.assertNotIn(b"first", result.stderr)
@@ -452,12 +548,12 @@ class NvcTests(unittest.TestCase):
     def test_concurrency_and_output_order(self):
         for jobs, expected in (("1", 1), ("3", 3), (None, 8), ("64", 12)):
             with self.subTest(jobs=jobs):
-                self.fixture.peak = 0
                 self.fixture.requests.clear()
                 names = [f"p{i}" for i in range(12)]
                 arrived = 0
                 active = 0
                 peak = 0
+
                 def response():
                     nonlocal arrived, active, peak
                     with self.fixture.lock:
@@ -465,11 +561,11 @@ class NvcTests(unittest.TestCase):
                         active += 1
                         peak = max(peak, active)
                         self.fixture.lock.notify_all()
-                        self.fixture.lock.wait_for(lambda: arrived >= expected, timeout=1)
+                        ready = self.fixture.lock.wait_for(lambda: arrived >= expected, timeout=4)
                     time.sleep(0.04)
                     with self.fixture.lock:
                         active -= 1
-                    return 200, release(), {}
+                    return (200, release(), {}) if ready else (500, b"", {})
                 for name in names:
                     self.fixture.routes[f"/repos/owner/{name}/releases/latest"] = response
                 result = self.run_nvc(config(*names), () if jobs is None else ("-j", jobs))
@@ -501,6 +597,14 @@ class NvcTests(unittest.TestCase):
                 self.assertNotIn(b"secret", result.stderr)
                 self.assertNotIn(b"suffix", result.stderr)
                 self.assert_no_network()
+
+    def test_invalid_token_isolated(self):
+        self.fixture.add("good")
+        text = config("bad") + "token_env=NVC_BAD_TOKEN\n" + config("good")
+        result = self.run_nvc(text, env={"NVC_BAD_TOKEN": "invalid token"})
+        self.assert_failure(result, "bad", "invalid authentication token")
+        self.assertEqual(result.stdout, b"good\tv1.2.3\n")
+        self.assertEqual(len(self.fixture.requests), 1)
 
     def state_args(self, command, *names):
         return (command, "-s", str(Path(self.directory.name) / "state.json"), *names)
@@ -623,7 +727,7 @@ class NvcTests(unittest.TestCase):
             self.assert_failure(self.run_nvc(text))
 
     def test_source_configuration_security(self):
-        for host in ("http://example.org", "https://user:secret@example.org", "https://example.org/#x", "https://example.org?x", "https://example.org/path", "https://"):
+        for host in ("http://example.org", "https://user:secret@example.org", "https://example.org/#x", "https://example.org#", "https://example.org?x", "https://example.org/path", "https:///example.org", "https://"):
             self.assert_failure(self.run_nvc(f"[good]\nsource=forgejo\nrepo=owner/good\nhost={host}\n"))
             self.assert_no_network()
         for expression in ("[", "no-capture"):
@@ -635,6 +739,172 @@ class NvcTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.fixture.requests[-1][1]["Authorization"], "Bearer forge-secret")
         self.assertNotIn(b"secret", result.stdout + result.stderr)
+
+    def test_regex_urls_and_first_capture(self):
+        text = "[good]\nsource=regex\nurl=https://example.org?format=versions\npattern=release=(v[0-9]+)\n"
+        route = "/?format=versions"
+        self.fixture.routes[route] = (200, b"release=v1 release=v2", {})
+        self.assert_result(self.run_nvc(text), b"good\tv1\n")
+        self.assertEqual([r[0] for r in self.fixture.requests], [route])
+        for suffix in ("include_regex=^v2$\n", "exclude_regex=^v1$\n"):
+            result = self.run_nvc(text + suffix)
+            self.assert_failure(result, "good", "no matching candidate")
+            self.assertEqual(result.stdout, b"")
+        self.fixture.routes[route] = (200, b"release=", {})
+        result = self.run_nvc(text.replace("(v[0-9]+)", "(v[0-9]+)?"))
+        self.assert_failure(result, "good", "invalid source response")
+        self.assertEqual(result.stdout, b"")
+        for url in ("https://example.org#", "https://example.org/#fragment",
+                    "https:///example.org", "https://user:secret@example.org/versions"):
+            with self.subTest(url=url):
+                self.fixture.requests.clear()
+                result = self.run_nvc(text.replace("https://example.org?format=versions", url))
+                self.assert_failure(result, "good", "invalid source configuration")
+                self.assert_no_network()
+                self.assertNotIn(b"secret", result.stderr)
+
+    def test_nested_gitlab_repository(self):
+        route = "/api/v4/projects/group%2Fsubgroup%2Fgood/releases?order_by=released_at&sort=desc&per_page=100&page=1"
+        self.fixture.routes[route] = (200, b'[{"tag_name":"v2"}]', {})
+        text = "[good]\nsource=gitlab\nhost=https://example.org\nrepo=group/subgroup/good\n"
+        self.assert_result(self.run_nvc(text), b"good\tv2\n")
+        self.assertEqual([r[0] for r in self.fixture.requests], [route])
+
+    def test_total_count_pagination(self):
+        cases = (
+            ("gitea-tags", "/api/v1/repos/owner/good/tags?limit=100&page=", "X-Total-Count"),
+            ("forgejo-tags", "/api/v1/repos/owner/good/tags?limit=100&page=", "X-Total-Count"),
+            ("gitlab-tags", "/api/v4/projects/owner%2Fgood/repository/tags?order_by=updated&sort=desc&per_page=100&page=", "X-Total"),
+        )
+        first = json.dumps([{"name": "16.2"}] * 50).encode()
+        for source, route, header in cases:
+            with self.subTest(source=source):
+                self.fixture.requests.clear()
+                self.fixture.routes[route + "1"] = (200, first, {header: "51"})
+                self.fixture.routes[route + "2"] = (200, b'[{"name":"17.0"}]', {})
+                text = f"[good]\nsource={source}\nrepo=owner/good\nhost=https://example.org\nsort=numeric\n"
+                self.assert_result(self.run_nvc(text), b"good\t17.0\n")
+                self.assertEqual([r[0] for r in self.fixture.requests], [route + "1", route + "2"])
+                self.fixture.requests.clear()
+                self.fixture.routes[route + "1"] = (200, first, {header: "51"})
+                self.assert_result(self.run_nvc(text.replace("sort=numeric\n", "include_regex=^17\n")),
+                                   b"good\t17.0\n")
+                self.assertEqual([r[0] for r in self.fixture.requests], [route + "1", route + "2"])
+
+    def test_pagination_completion(self):
+        route = "/api/v1/repos/owner/good/tags?limit=100&page="
+        text = "[good]\nsource=gitea-tags\nrepo=owner/good\nhost=https://example.org\nsort=numeric\n"
+        paths = [route + str(page) for page in range(1, 4)]
+        self.fixture.routes[paths[0]] = (200, b'[{"name":"1"}]', {"X-Total-Count": "3"})
+        self.fixture.routes[paths[1]] = (200, b'[{"name":"2"}]', {})
+        self.fixture.routes[paths[2]] = (200, b'[{"name":"3"}]', {})
+        self.assert_result(self.run_nvc(text), b"good\t3\n")
+        self.assertEqual([r[0] for r in self.fixture.requests], paths)
+        self.fixture.requests.clear()
+        self.fixture.routes[paths[2]] = (200, b"[]", {})
+        result = self.run_nvc(text)
+        self.assert_failure(result, "good", "empty page")
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual([r[0] for r in self.fixture.requests], paths)
+
+    def test_pagination_replaces_totals(self):
+        route = "/api/v1/repos/owner/good/tags?limit=100&page="
+        text = "[good]\nsource=gitea-tags\nrepo=owner/good\nhost=https://example.org\nsort=numeric\n"
+        for totals, expected in (((100, 2), "2"), ((2, 3), "3")):
+            with self.subTest(totals=totals):
+                self.fixture.requests.clear()
+                for page, total in enumerate(totals, 1):
+                    self.fixture.routes[route + str(page)] = (
+                        200, json.dumps([{"name": str(page)}]).encode(), {"X-Total-Count": str(total)},
+                    )
+                self.fixture.routes[route + "3"] = (200, b'[{"name":"3"}]', {})
+                self.assert_result(self.run_nvc(text), f"good\t{expected}\n".encode())
+                self.assertEqual([r[0] for r in self.fixture.requests],
+                                 [route + str(page) for page in range(1, int(expected) + 1)])
+
+    def test_pagination_at_page_cap(self):
+        route = "/api/v1/repos/owner/good/tags?limit=100&page="
+        text = "[good]\nsource=gitea-tags\nrepo=owner/good\nhost=https://example.org\nsort=numeric\n"
+        paths = [route + str(page) for page in range(1, 101)]
+        full = json.dumps([{"name": "1"}] * 100).encode()
+        for path in paths[:-1]:
+            self.fixture.routes[path] = (200, full, {})
+        short = b'[{"name":"2"}]'
+        for body, headers, complete in (
+            (short, {"X-Total-Count": "9901"}, True),
+            (full, {"X-Total-Count": "10000"}, False),
+            (short, {"X-Total-Count": "9901", "X-Next-Page": "101"}, False),
+        ):
+            with self.subTest(headers=headers):
+                self.fixture.requests.clear()
+                self.fixture.routes[paths[-1]] = (200, body, headers)
+                result = self.run_nvc(text)
+                if complete:
+                    self.assert_result(result, b"good\t2\n")
+                else:
+                    self.assert_failure(result, "good", "100 pages")
+                    self.assertEqual(result.stdout, b"")
+                self.assertEqual([r[0] for r in self.fixture.requests], paths)
+
+    def test_link_relation_parameters(self):
+        route = "/repos/owner/good/tags?per_page=100&page="
+        text = "[good]\nsource=github-tags\nrepo=owner/good\nsort=numeric\n"
+        self.fixture.routes[route + "2"] = (200, b'[{"name":"2"}]', {})
+        for link, next_page in (
+            ('<https://example.org/?rel=next>; rel=prev', False),
+            ('</>; rel=next-page', False),
+            ('</>; rel=next; anchor="/other"', False),
+            ('</>; rel=prev; rel=next', False),
+            ('</>; rel="next', False),
+            ('</previous>; rel=prev, </more>; title="a, b"; rel="alternate NEXT"', True),
+        ):
+            with self.subTest(link=link):
+                self.fixture.requests.clear()
+                self.fixture.routes[route + "1"] = (200, b'[{"name":"1"}]', {"Link": link})
+                self.assert_result(self.run_nvc(text), b"good\t2\n" if next_page else b"good\t1\n")
+                paths = [route + "1", route + "2"] if next_page else [route + "1"]
+                self.assertEqual([r[0] for r in self.fixture.requests], paths)
+
+    def test_informational_pagination_headers_are_ignored(self):
+        route = "/repos/owner/good/tags?per_page=100&page=1"
+        self.fixture.informational[route] = {
+            "Link": '</more>; rel="next"', "X-Next-Page": "2", "X-Total-Count": "2",
+        }
+        self.fixture.routes[route] = (200, b'[{"name":"1"}]', {})
+        text = "[good]\nsource=github-tags\nrepo=owner/good\nsort=numeric\n"
+        self.assert_result(self.run_nvc(text), b"good\t1\n")
+        self.assertEqual([r[0] for r in self.fixture.requests], [route])
+
+    def test_trailer_pagination_headers_are_ignored(self):
+        route = "/repos/owner/good/tags?per_page=100&page="
+        self.fixture.routes[route + "1"] = (200, b'[{"name":"1"}]', {})
+        self.fixture.trailers[route + "1"] = {
+            "Link": '</more>; rel="next"', "X-Next-Page": "2", "X-Total-Count": "2",
+        }
+        text = "[good]\nsource=github-tags\nrepo=owner/good\nsort=numeric\n"
+        self.assert_result(self.run_nvc(text), b"good\t1\n")
+        self.assertEqual([r[0] for r in self.fixture.requests], [route + "1"])
+        self.fixture.requests.clear()
+        self.fixture.routes[route + "1"] = (200, b'[{"name":"1"}]', {"X-Total-Count": "2"})
+        self.fixture.trailers[route + "1"] = {"X-Total-Count": "1"}
+        self.fixture.routes[route + "2"] = (200, b'[{"name":"2"}]', {})
+        self.assert_result(self.run_nvc(text), b"good\t2\n")
+        self.assertEqual([r[0] for r in self.fixture.requests], [route + "1", route + "2"])
+
+    def test_dot_repository_components(self):
+        for source, host, repo in (
+            ("github", "", "./good"),
+            ("forgejo", "host=https://example.org\n", "../good"),
+            ("gitlab", "host=https://example.org\n", "owner/./good"),
+        ):
+            self.assert_failure(self.run_nvc(f"[good]\nsource={source}\n{host}repo={repo}\n"))
+        self.assert_no_network()
+
+    def test_invalid_utf8_configuration(self):
+        for text in (b"[g\xffood]\nsource=github\nrepo=owner/good\n",
+                     config("good").encode() + b"prefix=\xc3\n"):
+            self.assert_failure(self.run_nvc(text, self.state_args("check")), pattern="utf-8")
+        self.assertEqual(self.fixture.requests, [])
 
     def test_short_page_markers_and_page_bound(self):
         cases = [
@@ -722,6 +992,82 @@ class NvcTests(unittest.TestCase):
         result = self.run_nvc(args=self.state_args("accept"), env={"GITHUB_TOKEN": "invalid token"})
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_offline_commands_reject_concurrency(self):
+        self.path.write_text(config("good"))
+        for command in ("compare", "accept"):
+            result = self.run_nvc(args=self.state_args(command) + ("-j", "2"))
+            self.assert_failure(result, pattern="network check")
+            self.assertEqual(result.stdout, b"")
+        self.assert_no_network()
+        self.assertFalse((Path(self.directory.name) / "state.json.lock").exists())
+
+    def test_state_identity_source_forms(self):
+        self.path.write_text(config("good"))
+        state = Path(self.directory.name) / "state.json"
+        base = ["github", "owner/good"] + [None] * 7
+        identities = [base + [None], base + ["main"], base + [None, "numeric"],
+                      ["github-commit"] + base[1:],
+                      ["github-commit"] + base[1:] + [None],
+                      ["unknown"] + base[1:], [None] + base[1:]]
+        for identity in identities:
+            with self.subTest(identity=identity):
+                saved = {"format": 1, "entries": {"good": {
+                    "identity": identity, "accepted": None, "pending": "v1", "eligible": True,
+                }}}
+                body = json.dumps(saved).encode()
+                state.write_bytes(body)
+                result = self.run_nvc(args=self.state_args("accept"))
+                self.assert_failure(result, pattern="invalid state format")
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(state.read_bytes(), body)
+        self.assert_no_network()
+
+    def test_state_and_lock_file_types(self):
+        self.path.write_text(config("good"))
+        state = Path(self.directory.name) / "state.json"
+        lock = Path(str(state) + ".lock")
+        target = Path(self.directory.name) / "target"
+        target.write_bytes(b"must remain unchanged")
+        for path in (state, lock):
+            for kind in ("fifo", "symlink", "directory"):
+                with self.subTest(path=path.name, kind=kind):
+                    if kind == "fifo":
+                        os.mkfifo(path)
+                    elif kind == "symlink":
+                        path.symlink_to(target)
+                    else:
+                        path.mkdir()
+                    try:
+                        result = self.run_nvc(args=self.state_args("compare"))
+                        self.assert_failure(result, str(path), "regular file|cannot open state")
+                        self.assertEqual(result.stdout, b"")
+                        self.assertEqual(target.read_bytes(), b"must remain unchanged")
+                    finally:
+                        if kind == "directory":
+                            path.rmdir()
+                        else:
+                            path.unlink()
+                        if path == state and lock.exists():
+                            lock.unlink()
+        self.assert_no_network()
+
+    def test_state_write_failure_preserves_previous(self):
+        self.fixture.add("good", release("v1"))
+        self.assert_result(self.run_nvc(config("good"), self.state_args("check")), b"good\tv1\n")
+        state = Path(self.directory.name) / "state.json"
+        previous = json.loads(state.read_text())
+        previous["entries"]["good"]["accepted"] = "x" * (LIMIT // 2)
+        previous["entries"]["good"]["pending"] = "y" * (LIMIT // 2 - 1000)
+        body = json.dumps(previous).encode()
+        self.assertLessEqual(len(body), LIMIT)
+        state.write_bytes(body)
+        self.fixture.add("good", release("z" * (LIMIT // 2 + 1000)))
+        result = self.run_nvc(args=self.state_args("check"))
+        self.assert_failure(result, str(state), "cannot serialize state")
+        self.assertEqual(result.stdout, b"good\t" + b"z" * (LIMIT // 2 + 1000) + b"\n")
+        self.assertEqual(state.read_bytes(), body)
+        self.assertEqual(list(state.parent.glob("state.json.tmp.*")), [])
+
     def test_truncated_state_corpus(self):
         self.path.write_text(config("good"))
         state = Path(self.directory.name) / "state.json"
@@ -734,19 +1080,27 @@ class NvcTests(unittest.TestCase):
             self.assertEqual(state.read_text(), body)
 
     def test_state_concurrent_disjoint_merge_and_removed(self):
-        self.fixture.add("first", delay=0.1)
-        self.fixture.add("second", delay=0.1)
-        self.path.write_text(config("first", "second"))
+        names = ("first", "second")
+        arrived = threading.Barrier(len(names), timeout=4)
+
+        def response():
+            try:
+                arrived.wait()
+            except threading.BrokenBarrierError:
+                return 500, b"", {}
+            return 200, release(), {}
+
+        for name in names:
+            self.fixture.routes[f"/repos/owner/{name}/releases/latest"] = response
+        self.path.write_text(config(*names))
         state = Path(self.directory.name) / "state.json"
-        env = os.environ.copy()
-        env.pop("GITHUB_TOKEN", None)
-        env.update(NVC_TEST_URL=self.fixture.url, NVC_TEST_TIMEOUT_MS="2000")
-        processes = [subprocess.Popen([BINARY, "check", "-c", str(self.path), "-s", str(state), name], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for name in ("first", "second")]
-        for proc in processes:
-            out, err = proc.communicate(timeout=10)
-            self.assertEqual(proc.returncode, 0, err)
-        self.assertEqual(set(json.loads(state.read_text())["entries"]), {"first", "second"})
-        self.assertEqual(self.run_nvc(config("first"), self.state_args("accept")).returncode, 0)
+        with ThreadPoolExecutor(max_workers=len(names)) as pool:
+            jobs = [pool.submit(self.run_nvc, args=self.state_args("check", name))
+                    for name in names]
+            for name, job in zip(names, jobs):
+                self.assert_result(job.result(), f"{name}\tv1.2.3\n".encode())
+        self.assertEqual(set(json.loads(state.read_text())["entries"]), set(names))
+        self.assert_result(self.run_nvc(config("first"), self.state_args("accept")), b"")
         self.assertIn("second", json.loads(state.read_text())["entries"])
 
 
@@ -754,6 +1108,11 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         raise SystemExit("usage: python3 -I tests/test.py ./nvc-test")
     BINARY = str(Path(sys.argv.pop(1)).resolve())
-    if not Path(BINARY).is_file():
-        raise SystemExit(f"test binary not found: {BINARY}")
+    try:
+        version = subprocess.run([BINARY, "--version"], env=test_env(),
+                                 capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SystemExit(f"cannot identify test binary: {error}")
+    if version.returncode or not version.stdout.startswith(b"nvc-test "):
+        raise SystemExit(f"fixture binary required: {BINARY}")
     unittest.main()

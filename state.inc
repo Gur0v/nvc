@@ -1,92 +1,14 @@
-static bool state_json_scan(const char **cursor, unsigned depth)
+static struct json_object *identity(const struct project *p)
 {
-	const char *p = *cursor;
-	while (*p && strchr(" \t\r\n", *p))
-		p++;
-	if (depth > 64)
-		return false;
-	if (*p == '{' || *p == '[') {
-		bool object = *p++ == '{';
-		char end = object ? '}' : ']';
-		struct json_object *keys = json_object_new_object();
-		if (!keys)
-			return false;
-		while (*p && strchr(" \t\r\n", *p))
-			p++;
-		while (*p != end) {
-			if (object) {
-				const char *start = p;
-				if (*p != '"' || !state_json_scan(&p, depth + 1))
-					goto bad;
-				struct json_object *key = parse_json(start, (size_t)(p - start));
-				if (!key || !json_object_is_type(key, json_type_string)) {
-					json_object_put(key);
-					goto bad;
-				}
-				const char *name = json_object_get_string(key);
-				struct json_object *existing;
-				if (controls(name, (size_t)json_object_get_string_len(key)) ||
-				    json_object_object_get_ex(keys, name, &existing)) {
-					json_object_put(key);
-					goto bad;
-				}
-				if (json_object_object_add(keys, name, key)) {
-					json_object_put(key);
-					goto bad;
-				}
-				while (*p && strchr(" \t\r\n", *p))
-					p++;
-				if (*p++ != ':')
-					goto bad;
-			}
-			if (!state_json_scan(&p, depth + 1))
-				goto bad;
-			while (*p && strchr(" \t\r\n", *p))
-				p++;
-			if (*p == end)
-				break;
-			if (*p++ != ',')
-				goto bad;
-			while (*p && strchr(" \t\r\n", *p))
-				p++;
-		}
-		json_object_put(keys);
-		*cursor = p + 1;
-		return true;
-	bad:
-		json_object_put(keys);
-		return false;
-	}
-	if (*p == '"') {
-		p++;
-		while (*p && *p != '"') {
-			if (*p++ == '\\') {
-				if (!*p)
-					return false;
-				p++;
-			}
-		}
-		if (*p++ != '"')
-			return false;
-	} else {
-		const char *start = p;
-		while (*p && !strchr(",]} \t\r\n", *p))
-			p++;
-		if (p == start)
-			return false;
-	}
-	*cursor = p;
-	return true;
-}
-
-static struct json_object *identity(struct project *p)
-{
-	struct json_object *id = json_object_new_array();
-	const char *values[] = {p->source,  p->repo,	p->host,   p->url,	p->regex,
-				p->include, p->exclude, p->prefix, p->token_env, p->branch, p->sort};
+	int len = p->sort ? 11 : p->branch ? 10 : 9;
+	struct json_object *id = json_object_new_array_ext(len);
+	const char *values[] = {
+		p->source, p->repo, p->host, p->url, p->regex, p->include, p->exclude,
+		p->prefix, p->token_env, p->branch, p->sort,
+	};
 	if (!id)
 		return NULL;
-	for (size_t i = 0; i < (p->sort ? 11U : p->branch ? 10U : 9U); i++) {
+	for (int i = 0; i < len; i++) {
 		struct json_object *v = values[i] ? json_object_new_string(values[i]) : NULL;
 		if ((values[i] && !v) || json_object_array_add(id, v)) {
 			json_object_put(v);
@@ -106,55 +28,80 @@ static bool state_string(struct json_object *v)
 			   (size_t)json_object_get_string_len(v)));
 }
 
+static bool state_identity(struct json_object *id)
+{
+	if (!json_object_is_type(id, json_type_array))
+		return false;
+	size_t len = json_object_array_length(id);
+	if (len < 9 || len > 11)
+		return false;
+	for (size_t i = 0; i < len; i++)
+		if (!state_string(json_object_array_get_idx(id, i)))
+			return false;
+	struct json_object *name = json_object_array_get_idx(id, 0);
+	if (!name)
+		return false;
+	const struct source_type *type = source_lookup(json_object_get_string(name));
+	if (!type)
+		return false;
+	if (type->operation == COMMIT)
+		return len == 10 && json_object_array_get_idx(id, 9);
+	if (len == 9)
+		return true;
+	if (len != 11 || type->operation != TAGS || json_object_array_get_idx(id, 9))
+		return false;
+	struct json_object *sort = json_object_array_get_idx(id, 10);
+	return sort && !strcmp(json_object_get_string(sort), "numeric");
+}
+
 static struct json_object *state_read(const char *path)
 {
-	FILE *f = fopen(path, "r");
+	int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
 	struct json_object *root = NULL, *format, *entries;
-	if (!f) {
-		if (errno != ENOENT)
+	if (fd < 0) {
+		if (errno != ENOENT) {
+			fprintf(stderr, "nvc: %s: cannot open state file: %s\n", path, strerror(errno));
 			return NULL;
-		root = json_object_new_object();
+		}
+		static const char empty[] = "{\"format\":1,\"entries\":{}}";
+		root = parse_document(empty, sizeof(empty) - 1);
 		if (!root)
-			return NULL;
-		struct json_object *version = json_object_new_int(1);
-		struct json_object *items = json_object_new_object();
-		if (!version || !items) {
-			json_object_put(version);
-			json_object_put(items);
-			json_object_put(root);
-			return NULL;
-		}
-		if (json_object_object_add(root, "format", version)) {
-			json_object_put(version);
-			json_object_put(items);
-			json_object_put(root);
-			return NULL;
-		}
-		if (json_object_object_add(root, "entries", items)) {
-			json_object_put(items);
-			json_object_put(root);
-			return NULL;
-		}
+			fprintf(stderr, "nvc: %s: cannot initialize state\n", path);
 		return root;
+	}
+	struct stat st;
+	if (fstat(fd, &st) < 0) {
+		fprintf(stderr, "nvc: %s: cannot stat state file: %s\n", path, strerror(errno));
+		close(fd);
+		return NULL;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "nvc: %s: state file must be a regular file\n", path);
+		close(fd);
+		return NULL;
+	}
+	FILE *f = fdopen(fd, "r");
+	if (!f) {
+		fprintf(stderr, "nvc: %s: cannot open state stream: %s\n", path, strerror(errno));
+		close(fd);
+		return NULL;
 	}
 	char *body = malloc(CONFIG_MAX + 1);
 	if (!body) {
+		fprintf(stderr, "nvc: %s: cannot allocate state buffer\n", path);
 		fclose(f);
 		return NULL;
 	}
 	size_t n = fread(body, 1, CONFIG_MAX + 1, f);
-	bool valid = !ferror(f) && n <= CONFIG_MAX;
-	if (fclose(f))
-		valid = false;
-	if (valid) {
-		body[n] = 0;
-		const char *cursor = body;
-		root = parse_json(body, n);
-		if (root && !state_json_scan(&cursor, 0)) {
-			json_object_put(root);
-			root = NULL;
-		}
+	bool valid = !ferror(f);
+	if (fclose(f) || !valid || n > CONFIG_MAX) {
+		fprintf(stderr, "nvc: %s: %s\n", path,
+			n > CONFIG_MAX ? "state exceeds 1 MiB" : "cannot read state file");
+		free(body);
+		return NULL;
 	}
+	body[n] = 0;
+	root = parse_document(body, n);
 	free(body);
 	if (!root || !json_object_is_type(root, json_type_object) ||
 	    json_object_object_length(root) != 2 ||
@@ -166,13 +113,10 @@ static struct json_object *state_read(const char *path)
 	json_object_object_foreach(entries, name, entry)
 	{
 		struct json_object *id, *accepted, *pending, *eligible;
-		if (!*name || controls(name, strlen(name)) ||
-		    !json_object_is_type(entry, json_type_object) ||
+		if (!*name || !json_object_is_type(entry, json_type_object) ||
 		    json_object_object_length(entry) != 4 ||
 		    !json_object_object_get_ex(entry, "identity", &id) ||
-		    !json_object_is_type(id, json_type_array) ||
-		    (json_object_array_length(id) != 9 && json_object_array_length(id) != 10 &&
-		     json_object_array_length(id) != 11) ||
+		    !state_identity(id) ||
 		    !json_object_object_get_ex(entry, "accepted", &accepted) ||
 		    !state_string(accepted) ||
 		    !json_object_object_get_ex(entry, "pending", &pending) ||
@@ -181,26 +125,10 @@ static struct json_object *state_read(const char *path)
 		    !json_object_is_type(eligible, json_type_boolean) ||
 		    (json_object_get_boolean(eligible) && !pending))
 			goto bad;
-		if ((json_object_array_length(id) == 10 &&
-		     !json_object_is_type(json_object_array_get_idx(id, 9), json_type_string)) ||
-		    !json_object_is_type(json_object_array_get_idx(id, 0), json_type_string))
-			goto bad;
-		if (json_object_array_length(id) == 11) {
-			const struct source_type *type =
-				source_lookup(json_object_get_string(json_object_array_get_idx(id, 0)));
-			struct json_object *sort = json_object_array_get_idx(id, 10);
-			if (json_object_array_get_idx(id, 9) ||
-			    !type || type->operation != TAGS ||
-			    !json_object_is_type(sort, json_type_string) ||
-			    strcmp(json_object_get_string(sort), "numeric"))
-				goto bad;
-		}
-		for (size_t i = 0; i < json_object_array_length(id); i++)
-			if (!state_string(json_object_array_get_idx(id, i)))
-				goto bad;
 	}
 	return root;
 bad:
+	fprintf(stderr, "nvc: %s: invalid state format\n", path);
 	json_object_put(root);
 	return NULL;
 }
@@ -208,86 +136,157 @@ bad:
 static int state_write(const char *path, struct json_object *root)
 {
 	const char *body = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
-	if (!body || strlen(body) > CONFIG_MAX) {
-		errno = EFBIG;
-		return -1;
+	const char *operation = "serialize state";
+	char *temp = NULL, *directory = NULL;
+	int fd = -1, dirfd = -1, error = 0;
+	bool created = false, renamed = false;
+	if (!body) {
+		errno = ENOMEM;
+		goto failed;
 	}
-	char *temp = malloc(strlen(path) + 16), *directory = strdup(path);
-	int fd = -1, dirfd = -1, result = -1;
-	bool created = false;
-	if (!temp || !directory)
-		goto done;
+	size_t len = strlen(body), offset = 0;
+	if (len > CONFIG_MAX) {
+		errno = EFBIG;
+		goto failed;
+	}
+	operation = "allocate state paths";
+	temp = malloc(strlen(path) + 16);
+	if (!temp)
+		goto failed;
+	directory = strdup(path);
+	if (!directory)
+		goto failed;
 	char *slash = strrchr(directory, '/');
 	if (slash) {
 		if (slash == directory)
 			slash[1] = 0;
 		else
 			*slash = 0;
-	} else
-		strcpy(directory, ".");
-	dirfd = open(directory, O_RDONLY | O_DIRECTORY);
+	}
+	operation = "open state directory";
+	dirfd = open(slash ? directory : ".", O_RDONLY | O_DIRECTORY);
 	if (dirfd < 0)
-		goto done;
+		goto failed;
+	operation = "create temporary state file";
 	sprintf(temp, "%s.tmp.XXXXXX", path);
 	fd = mkstemp(temp);
 	if (fd < 0)
-		goto done;
+		goto failed;
 	created = true;
-	size_t len = strlen(body), offset = 0;
+	operation = "write temporary state file";
 	while (offset < len) {
 		ssize_t n = write(fd, body + offset, len - offset);
 		if (n < 0 && errno == EINTR)
 			continue;
+		if (n == 0)
+			errno = EIO;
 		if (n <= 0)
-			goto done;
+			goto failed;
 		offset += (size_t)n;
 	}
+	operation = "sync temporary state file";
 	if (fsync(fd))
-		goto done;
+		goto failed;
+	operation = "close temporary state file";
 	if (close(fd)) {
 		fd = -1;
-		goto done;
+		goto failed;
 	}
 	fd = -1;
 #ifdef NVC_TEST
 	if (getenv("NVC_TEST_STATE_INTERRUPT"))
 		_exit(99);
 #endif
-	if (rename(temp, path) || fsync(dirfd))
-		goto done;
-	result = 0;
+	operation = "replace state file";
+	if (rename(temp, path))
+		goto failed;
+	renamed = true;
+	operation = "sync state directory";
+	if (fsync(dirfd))
+		goto failed;
+	goto done;
+failed:
+	error = errno;
 done:
 	if (fd >= 0)
 		close(fd);
 	if (dirfd >= 0)
 		close(dirfd);
-	if (result && created)
+	if (created && !renamed)
 		unlink(temp);
 	free(temp);
 	free(directory);
-	return result;
+	if (!error)
+		return 0;
+	fprintf(stderr, "nvc: %s: cannot %s: %s%s\n", path, operation, strerror(error),
+		renamed ? "; new state is already visible" : "");
+	errno = error;
+	return -1;
+}
+
+static int state_observe(struct json_object *entries, const struct project *p,
+			 struct json_object *id, struct json_object *accepted,
+			 struct json_object *pending)
+{
+	struct json_object *entry = json_object_new_object();
+	if (!entry)
+		return -1;
+	bool success = p->version && !p->error[0];
+	struct json_object *value = success ? json_object_new_string(p->version)
+					    : json_object_get(pending);
+	struct json_object *eligible = json_object_new_boolean(success);
+	struct {
+		const char *key;
+		struct json_object *value;
+	} fields[] = {
+		{"identity", json_object_get(id)},
+		{"accepted", json_object_get(accepted)},
+		{"pending", value},
+		{"eligible", eligible},
+	};
+	size_t i = 0, len = sizeof(fields) / sizeof(*fields);
+	if (eligible && (!success || value)) {
+		for (; i < len; i++)
+			if (json_object_object_add(entry, fields[i].key, fields[i].value))
+				break;
+		if (i == len && !json_object_object_add(entries, p->name, entry))
+			return 0;
+	}
+	for (; i < len; i++)
+		json_object_put(fields[i].value);
+	json_object_put(entry);
+	return -1;
 }
 
 static int state_run(struct config *cfg, const char *path, const char *command)
 {
 	char *lockpath = malloc(strlen(path) + 6);
 	struct json_object *root = NULL, *entries;
+	const char *operation = "allocate state lock path";
 	int fd = -1, status = 1;
 	if (!lockpath)
-		goto done;
+		goto lock_error;
 	sprintf(lockpath, "%s.lock", path);
-	fd = open(lockpath, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+	operation = "open state lock";
+	fd = open(lockpath, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0600);
 	if (fd < 0)
-		goto done;
-	struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
-	while (fcntl(fd, F_SETLKW, &lock) < 0)
-		if (errno != EINTR)
-			goto done;
-	root = state_read(path);
-	if (!root) {
-		fprintf(stderr, "nvc: invalid or unreadable state\n");
+		goto lock_error;
+	struct stat st;
+	operation = "stat state lock";
+	if (fstat(fd, &st) < 0)
+		goto lock_error;
+	if (!S_ISREG(st.st_mode)) {
+		fprintf(stderr, "nvc: %s: state lock must be a regular file\n", lockpath);
 		goto done;
 	}
+	struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+	operation = "acquire state lock";
+	while (fcntl(fd, F_SETLKW, &lock) < 0)
+		if (errno != EINTR)
+			goto lock_error;
+	root = state_read(path);
+	if (!root)
+		goto done;
 	json_object_object_get_ex(root, "entries", &entries);
 	status = 0;
 	bool check = !strcmp(command, "check"), accept = !strcmp(command, "accept");
@@ -302,10 +301,8 @@ static int state_run(struct config *cfg, const char *path, const char *command)
 		if (!p->selected)
 			continue;
 		struct json_object *id = identity(p);
-		if (!id) {
-			status = 1;
-			break;
-		}
+		if (!id)
+			goto allocation_error;
 		json_object_object_get_ex(entries, p->name, &entry);
 		if (entry)
 			json_object_object_get_ex(entry, "identity", &oldid);
@@ -316,60 +313,10 @@ static int state_run(struct config *cfg, const char *path, const char *command)
 			json_object_object_get_ex(entry, "eligible", &eligible);
 		}
 		if (check) {
-			struct json_object *next = json_object_new_object();
-			if (!next) {
-				json_object_put(id);
-				status = 1;
-				break;
-			}
-			struct json_object *value = p->version && !p->error[0]
-							? json_object_new_string(p->version)
-							: json_object_get(pending);
-			struct json_object *ok =
-			    json_object_new_boolean(p->version && !p->error[0]);
-			if ((p->version && !p->error[0] && !value) || !ok) {
-				json_object_put(value);
-				json_object_put(ok);
-				json_object_put(id);
-				json_object_put(next);
-				status = 1;
-				break;
-			}
-			if (json_object_object_add(next, "identity", id)) {
-				json_object_put(id);
-				json_object_put(value);
-				json_object_put(ok);
-				json_object_put(next);
-				status = 1;
-				break;
-			}
-			struct json_object *a = json_object_get(accepted);
-			if (json_object_object_add(next, "accepted", a)) {
-				json_object_put(a);
-				json_object_put(value);
-				json_object_put(ok);
-				json_object_put(next);
-				status = 1;
-				break;
-			}
-			if (json_object_object_add(next, "pending", value)) {
-				json_object_put(value);
-				json_object_put(ok);
-				json_object_put(next);
-				status = 1;
-				break;
-			}
-			if (json_object_object_add(next, "eligible", ok)) {
-				json_object_put(ok);
-				json_object_put(next);
-				status = 1;
-				break;
-			}
-			if (json_object_object_add(entries, p->name, next)) {
-				json_object_put(next);
-				status = 1;
-				break;
-			}
+			int rc = state_observe(entries, p, id, accepted, pending);
+			json_object_put(id);
+			if (rc)
+				goto allocation_error;
 			continue;
 		}
 		json_object_put(id);
@@ -382,7 +329,7 @@ static int state_run(struct config *cfg, const char *path, const char *command)
 				struct json_object *value = json_object_get(pending);
 				if (json_object_object_add(entry, "accepted", value)) {
 					json_object_put(value);
-					status = 1;
+					goto allocation_error;
 				}
 			}
 		} else {
@@ -394,18 +341,30 @@ static int state_run(struct config *cfg, const char *path, const char *command)
 					   : strcmp(a, v) ? "changed"
 							  : "unchanged";
 			if (printf("%s\t%s\t%s\t%s\n", p->name, kind, a, v) < 0)
+				goto stdout_error;
+			if (!valid) {
+				fprintf(stderr, "nvc: %s: %s observation\n", p->name, kind);
 				status = 1;
-			if (!valid)
-				status = 1;
+			}
 		}
 	}
 	if ((check || accept) && !status && state_write(path, root))
 		status = 1;
-	if (fflush(stdout) || ferror(stdout))
-		status = 1;
+	if (!check && !accept && (fflush(stdout) || ferror(stdout)))
+		goto stdout_error;
+	goto done;
+lock_error:
+	fprintf(stderr, "nvc: %s: cannot %s: %s\n", lockpath ? lockpath : path,
+		operation, strerror(errno));
+	goto done;
+allocation_error:
+	fprintf(stderr, "nvc: %s: cannot allocate state entry\n", path);
+	status = 1;
+	goto done;
+stdout_error:
+	fprintf(stderr, "nvc: cannot write stdout\n");
+	status = 1;
 done:
-	if (status)
-		fprintf(stderr, "nvc: state operation failed\n");
 	json_object_put(root);
 	if (fd >= 0)
 		close(fd);
